@@ -113,7 +113,7 @@ The name means "in a hurry" (زتات) in Bahraini Arabic. Seemed fitting.
 ### From source
 
 ```sh
-git clone <your-repo-url> zatat
+git clone https://github.com/Dokan-E-Commerce/zatat.git zatat
 cd zatat
 cargo build --release
 cp zatat.toml.example zatat.toml
