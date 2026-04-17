@@ -1,11 +1,9 @@
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use crypto_secretbox::aead::generic_array::GenericArray;
+use crypto_secretbox::aead::rand_core::RngCore;
 use crypto_secretbox::aead::{Aead, KeyInit, OsRng};
 use crypto_secretbox::{Key, XSalsa20Poly1305};
-#[allow(unused_imports)]
-use rand::rngs::OsRng as _;
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};

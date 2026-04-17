@@ -3109,7 +3109,7 @@ name = "zatat-core"
 version = "0.1.0"
 dependencies = [
  "globset",
- "rand 0.8.5",
+ "rand 0.9.4",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -3158,7 +3158,7 @@ dependencies = [
  "hex",
  "hmac",
  "md-5",
- "rand 0.8.5",
+ "rand 0.9.4",
  "serde",
  "serde_json",
  "sha2",

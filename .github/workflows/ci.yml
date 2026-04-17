@@ -6,6 +6,12 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Principle of least privilege: CI only needs to read the repo. If a step
+# ever starts pushing to the repo or to a package registry it can request
+# the extra scope at the job level.
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true

@@ -6,6 +6,11 @@ on:
       - "v*"
   workflow_dispatch:
 
+# Least-privilege default; the docker job escalates to `packages: write`
+# only for the duration of its own steps.
+permissions:
+  contents: read
+
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}

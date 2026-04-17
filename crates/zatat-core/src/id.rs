@@ -57,9 +57,9 @@ impl SocketId {
     /// Generates a `"{rand}.{rand}"` socket id where each half is in
     /// `1..=1_000_000_000`. No zero padding.
     pub fn generate() -> Self {
-        let mut rng = rand::thread_rng();
-        let a: u64 = rng.gen_range(1..=1_000_000_000);
-        let b: u64 = rng.gen_range(1..=1_000_000_000);
+        let mut rng = rand::rng();
+        let a: u64 = rng.random_range(1..=1_000_000_000);
+        let b: u64 = rng.random_range(1..=1_000_000_000);
         Self(format!("{a}.{b}"))
     }
 
