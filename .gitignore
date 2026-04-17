@@ -31,6 +31,9 @@ bench/results
 .vscode
 *.iml
 
+# Local deployment config — not part of the public source tree
+/terraform
+
 # Local assistant / scratch files
 CLAUDE.md
 /.claude
