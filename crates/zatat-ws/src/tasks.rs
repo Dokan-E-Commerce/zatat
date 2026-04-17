@@ -19,7 +19,7 @@ pub async fn presence_snapshot_publisher(state: ServerState) {
 
     loop {
         tick.tick().await;
-        for app in state.config.apps_by_id.values() {
+        for app in state.config.apps().by_id.values() {
             publish_snapshots_for_app(&state, app).await;
         }
     }
@@ -77,9 +77,7 @@ pub async fn presence_cache_gc(state: ServerState) {
         for member in expired {
             let Some(app) = state
                 .config
-                .apps_by_id
-                .get(&zatat_core::id::AppId::from(member.app_id.as_str()))
-                .cloned()
+                .app_by_id(&zatat_core::id::AppId::from(member.app_id.as_str()))
             else {
                 continue;
             };

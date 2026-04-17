@@ -105,9 +105,7 @@ where
 fn resolve_app(state: &ApiState, app_id: &str) -> Result<AppArc, ApiError> {
     state
         .config
-        .apps_by_id
-        .get(&AppId::from(app_id))
-        .cloned()
+        .app_by_id(&AppId::from(app_id))
         .ok_or_else(|| ApiError(404, "Application does not exist".into()))
 }
 

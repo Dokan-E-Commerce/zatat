@@ -34,11 +34,29 @@ impl From<figment::Error> for ConfigError {
     }
 }
 
-#[derive(Clone, Debug)]
+/// Live, atomically-swappable lookup tables for the currently-active apps.
+/// Existing connections hold their own `AppArc` clones so removing an app
+/// here never affects live traffic.
+#[derive(Debug, Default)]
+pub struct AppIndex {
+    pub by_id: HashMap<AppId, AppArc>,
+    pub by_key: HashMap<AppKey, AppArc>,
+}
+
+#[derive(Clone)]
 pub struct Config {
     pub server: ServerConfig,
-    pub apps_by_id: HashMap<AppId, AppArc>,
-    pub apps_by_key: HashMap<AppKey, AppArc>,
+    apps: std::sync::Arc<arc_swap::ArcSwap<AppIndex>>,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let idx = self.apps();
+        f.debug_struct("Config")
+            .field("server", &self.server)
+            .field("apps", &idx.by_id.len())
+            .finish()
+    }
 }
 
 impl Config {
@@ -55,6 +73,30 @@ impl Config {
             .merge(Env::prefixed("ZATAT_").split("__"))
             .extract()?;
         raw.compile()
+    }
+
+    /// Current apps table. Cheap to call (clones an `Arc`).
+    pub fn apps(&self) -> std::sync::Arc<AppIndex> {
+        self.apps.load_full()
+    }
+
+    pub fn app_by_id(&self, id: &AppId) -> Option<AppArc> {
+        self.apps.load().by_id.get(id).cloned()
+    }
+
+    pub fn app_by_key(&self, key: &AppKey) -> Option<AppArc> {
+        self.apps.load().by_key.get(key).cloned()
+    }
+
+    /// Re-parse `path` and atomically replace the apps table. The `server`
+    /// block is intentionally NOT re-applied — host/port/TLS/Redis changes
+    /// still need a process restart. Returns the number of apps loaded.
+    pub fn reload_apps_from(&self, path: &Path) -> Result<usize, ConfigError> {
+        let raw: RawConfig = Figment::new().merge(Toml::file(path)).extract()?;
+        let next = raw.build_app_index()?;
+        let n = next.by_id.len();
+        self.apps.store(std::sync::Arc::new(next));
+        Ok(n)
     }
 }
 
@@ -280,8 +322,21 @@ impl RawConfig {
             }),
         };
 
-        let mut apps_by_id: HashMap<AppId, AppArc> = HashMap::new();
-        let mut apps_by_key: HashMap<AppKey, AppArc> = HashMap::new();
+        let index = RawConfig {
+            server: Default::default(),
+            apps: self.apps,
+        }
+        .build_app_index()?;
+
+        Ok(Config {
+            server,
+            apps: std::sync::Arc::new(arc_swap::ArcSwap::from(std::sync::Arc::new(index))),
+        })
+    }
+
+    fn build_app_index(self) -> Result<AppIndex, ConfigError> {
+        let mut by_id: HashMap<AppId, AppArc> = HashMap::new();
+        let mut by_key: HashMap<AppKey, AppArc> = HashMap::new();
         for raw in self.apps {
             let app = Application::new(
                 AppId::from(raw.id.clone()),
@@ -304,18 +359,14 @@ impl RawConfig {
                 Some(raw.cache_ttl_seconds)
             });
             let arc = Arc::new(app);
-            if apps_by_id.insert(arc.id.clone(), arc.clone()).is_some() {
+            if by_id.insert(arc.id.clone(), arc.clone()).is_some() {
                 return Err(ConfigError::DuplicateAppId(raw.id));
             }
-            if apps_by_key.insert(arc.key.clone(), arc.clone()).is_some() {
+            if by_key.insert(arc.key.clone(), arc.clone()).is_some() {
                 return Err(ConfigError::DuplicateAppKey(raw.key));
             }
         }
-        Ok(Config {
-            server,
-            apps_by_id,
-            apps_by_key,
-        })
+        Ok(AppIndex { by_id, by_key })
     }
 }
 
@@ -343,8 +394,68 @@ allowed_origins = ["*"]
         .unwrap();
         let cfg = Config::load(&tmp).unwrap();
         assert_eq!(cfg.server.port, 8080);
-        assert_eq!(cfg.apps_by_id.len(), 1);
-        assert!(cfg.apps_by_key.contains_key(&AppKey::from("k")));
+        assert_eq!(cfg.apps().by_id.len(), 1);
+        assert!(cfg.app_by_key(&AppKey::from("k")).is_some());
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn reload_swaps_apps_atomically() {
+        let tmp = std::env::temp_dir().join("zatat-reload-test.toml");
+        std::fs::write(
+            &tmp,
+            r#"
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[[apps]]
+id = "a"
+key = "k1"
+secret = "s1"
+allowed_origins = ["*"]
+"#,
+        )
+        .unwrap();
+
+        let cfg = Config::load(&tmp).unwrap();
+        let before = cfg.app_by_key(&AppKey::from("k1")).unwrap();
+        assert_eq!(before.secret, "s1");
+
+        // Rewrite the file with rotated secret + extra app, reload.
+        std::fs::write(
+            &tmp,
+            r#"
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[[apps]]
+id = "a"
+key = "k1"
+secret = "s1-new"
+allowed_origins = ["*"]
+
+[[apps]]
+id = "b"
+key = "k2"
+secret = "s2"
+allowed_origins = ["*"]
+"#,
+        )
+        .unwrap();
+
+        let n = cfg.reload_apps_from(&tmp).unwrap();
+        assert_eq!(n, 2);
+
+        let updated = cfg.app_by_key(&AppKey::from("k1")).unwrap();
+        assert_eq!(updated.secret, "s1-new");
+        assert!(cfg.app_by_key(&AppKey::from("k2")).is_some());
+
+        // The Arc captured BEFORE reload keeps its old secret — existing
+        // connections observe the config they opened with.
+        assert_eq!(before.secret, "s1");
+
         let _ = std::fs::remove_file(&tmp);
     }
 }

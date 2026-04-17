@@ -9,7 +9,6 @@ use axum::Router;
 use serde::Deserialize;
 use tracing::{info, warn};
 
-use zatat_core::error::PusherError;
 use zatat_core::id::AppKey;
 
 use crate::handler::run_connection;
@@ -44,8 +43,8 @@ async fn ws_upgrade(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    let app = match state.config.apps_by_key.get(&AppKey::from(app_key.clone())) {
-        Some(app) => app.clone(),
+    let app = match state.config.app_by_key(&AppKey::from(app_key.clone())) {
+        Some(app) => app,
         None => {
             warn!(app_key = %app_key, "rejected connection: unknown app_key");
             return (StatusCode::UNAUTHORIZED, "Application does not exist").into_response();
@@ -65,23 +64,46 @@ async fn ws_upgrade(
         .get("origin")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    if let Some(origin_hdr) = origin.as_deref() {
-        let host = url_host_or_self(origin_hdr);
-        if !app.origin_is_allowed(host) {
-            warn!(app = %app.id, origin = %origin_hdr, "rejected: origin not allowed");
-            return (StatusCode::FORBIDDEN, PusherError::InvalidOrigin.message()).into_response();
-        }
+    let origin_blocked = match origin.as_deref() {
+        Some(origin_hdr) => !app.origin_is_allowed(url_host_or_self(origin_hdr)),
+        None => false,
+    };
+    if origin_blocked {
+        warn!(
+            app = %app.id,
+            origin = origin.as_deref().unwrap_or("<none>"),
+            allowed = ?app.allowed_origins_raw,
+            "origin rejected — accepting WS and sending pusher:error 4009 so the client can see why"
+        );
+    } else {
+        info!(
+            app = %app.id,
+            peer = %peer,
+            origin = origin.as_deref().unwrap_or("<none>"),
+            "ws upgrade accepted"
+        );
     }
 
-    info!(
-        app = %app.id,
-        peer = %peer,
-        origin = origin.as_deref().unwrap_or("<none>"),
-        "ws upgrade accepted"
-    );
-
+    // Pusher protocol contract: upgrade the WS first, THEN deliver any
+    // connection-refusal as a `pusher:error` frame. That's the only way a
+    // browser-side pusher-js client ever surfaces the reason — an HTTP
+    // 403 pre-upgrade looks to JS like a generic "WS failed".
+    let origin_for_msg = origin.clone();
     ws.on_upgrade(move |socket| async move {
-        run_connection(state, app, socket, origin).await;
+        if origin_blocked {
+            crate::handler::run_rejected_connection(
+                socket,
+                4009,
+                format!(
+                    "Origin '{}' is not in the allowed list for app '{}'",
+                    origin_for_msg.as_deref().unwrap_or(""),
+                    app.id,
+                ),
+            )
+            .await;
+        } else {
+            run_connection(state, app, socket, origin).await;
+        }
     })
 }
 

@@ -20,6 +20,22 @@ use zatat_webhooks::WebhookEvent;
 
 use crate::state::ServerState;
 
+/// Accept a WS that the router has decided to reject (origin denied,
+/// over quota, etc.), send a `pusher:error` frame with the real reason,
+/// and close with a matching Pusher close code. Gives the browser-side
+/// client a clear error to surface instead of an opaque WS failure.
+pub async fn run_rejected_connection(socket: WebSocket, code: u16, reason: String) {
+    let (mut sink, _stream) = socket.split();
+    let frame = outbound::error_with_message(code, &reason);
+    let _ = sink.send(Message::Text(frame)).await;
+    let _ = sink
+        .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+            code,
+            reason: reason.into(),
+        })))
+        .await;
+}
+
 pub async fn run_connection(
     state: ServerState,
     app: AppArc,

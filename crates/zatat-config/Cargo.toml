@@ -12,3 +12,4 @@ serde_json.workspace = true
 figment.workspace = true
 toml.workspace = true
 thiserror.workspace = true
+arc-swap.workspace = true

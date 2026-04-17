@@ -3086,6 +3086,7 @@ dependencies = [
 name = "zatat-config"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "figment",
  "serde",
  "serde_json",

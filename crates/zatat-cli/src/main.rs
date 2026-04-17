@@ -104,7 +104,7 @@ async fn start(config_path: &Path, debug: bool) -> Result<()> {
 
     if scaling_enabled {
         let dispatcher = state.dispatcher.clone();
-        let config_apps = config.apps_by_id.clone();
+        let config_for_bus = config.clone();
         let provider_clone = provider.clone();
         tokio::spawn(async move {
             use tokio::sync::broadcast::error::RecvError;
@@ -113,7 +113,7 @@ async fn start(config_path: &Path, debug: bool) -> Result<()> {
                     match rx.recv().await {
                         Ok(bytes) => {
                             if let Ok(env) = zatat_scaling::message::parse(&bytes) {
-                                dispatcher.handle_incoming(env, |id| config_apps.get(id).cloned());
+                                dispatcher.handle_incoming(env, |id| config_for_bus.app_by_id(id));
                             }
                         }
                         Err(RecvError::Lagged(n)) => {
@@ -137,6 +137,9 @@ async fn start(config_path: &Path, debug: bool) -> Result<()> {
         state.clone(),
         state.tracker.clone(),
     ));
+    // Watch zatat.toml; swap the [[apps]] table on mtime change.
+    // Live WS connections keep their captured AppArc and are unaffected.
+    tokio::spawn(watch_config_apps(config.clone(), config_path.to_path_buf()));
 
     // When `server.path` is set, WS + REST routes live under that prefix;
     // `/health` stays at the root so LB probes don't need the prefix.
@@ -232,6 +235,37 @@ async fn start(config_path: &Path, debug: bool) -> Result<()> {
 
     info!("shutdown complete");
     Ok(())
+}
+
+/// Polls zatat.toml for mtime changes every N seconds (default 5,
+/// override via `ZATAT_APPS_RELOAD_INTERVAL_S`). On change, re-parses
+/// the file and atomically swaps the apps table. Existing WS
+/// connections keep the `AppArc` they captured at upgrade time, so
+/// they observe the apps config they connected with — no disconnect.
+async fn watch_config_apps(config: Config, path: PathBuf) {
+    let interval_s = std::env::var("ZATAT_APPS_RELOAD_INTERVAL_S")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(5);
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval_s));
+    tick.tick().await;
+    let mut last = std::time::SystemTime::now();
+    loop {
+        tick.tick().await;
+        let Ok(meta) = tokio::fs::metadata(&path).await else {
+            continue;
+        };
+        let Ok(mtime) = meta.modified() else { continue };
+        if mtime > last {
+            match config.reload_apps_from(&path) {
+                Ok(n) => {
+                    last = mtime;
+                    info!(apps = n, file = %path.display(), "apps config reloaded");
+                }
+                Err(err) => warn!(%err, "apps reload failed; keeping previous apps"),
+            }
+        }
+    }
 }
 
 /// Polls the cert + key files every 30s; when either mtime advances past

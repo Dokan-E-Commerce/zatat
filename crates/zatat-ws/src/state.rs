@@ -4,6 +4,8 @@ use tokio::sync::broadcast;
 
 use zatat_channels::ChannelManager;
 use zatat_config::Config;
+use zatat_core::application::Application;
+use zatat_core::id::AppId;
 use zatat_scaling::{EventDispatcher, LocalOnlyProvider, PubSubProvider};
 use zatat_webhooks::{CompiledTarget, WebhookConfig, WebhookDispatcher};
 
@@ -21,7 +23,7 @@ pub struct ServerStateInner {
 impl std::fmt::Debug for ServerStateInner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ServerStateInner")
-            .field("apps", &self.config.apps_by_id.len())
+            .field("apps", &self.config.apps().by_id.len())
             .field("connections", &self.connection_count_total())
             .finish()
     }
@@ -43,9 +45,14 @@ impl ServerStateInner {
             provider,
             scaling_enabled,
         ));
-        let targets_by_app = compile_webhook_targets(&config);
+        // Webhook lookup reads the LIVE apps table, so adding/removing
+        // webhook targets via a config reload takes effect immediately.
+        let config_for_webhooks = config.clone();
         let webhooks = Arc::new(WebhookDispatcher::spawn(move |app_id| {
-            targets_by_app.get(app_id).cloned().unwrap_or_default()
+            let Some(app) = config_for_webhooks.app_by_id(&AppId::from(app_id)) else {
+                return Vec::new();
+            };
+            compile_webhook_targets_for_app(&app)
         }));
         let (shutdown, _) = broadcast::channel(1);
         Arc::new(Self {
@@ -64,40 +71,33 @@ impl ServerStateInner {
 
     pub fn connection_count_total(&self) -> usize {
         self.config
-            .apps_by_id
+            .apps()
+            .by_id
             .keys()
             .map(|id| self.channels.connection_count(id))
             .sum()
     }
 }
 
-fn compile_webhook_targets(
-    config: &Config,
-) -> std::collections::HashMap<String, Vec<CompiledTarget>> {
+fn compile_webhook_targets_for_app(app: &Application) -> Vec<CompiledTarget> {
     use tracing::warn;
-    let mut map: std::collections::HashMap<String, Vec<CompiledTarget>> = Default::default();
-    for (id, app) in &config.apps_by_id {
-        let mut targets = Vec::new();
-        for raw in &app.webhooks {
-            let cfg: WebhookConfig = match serde_json::from_value(raw.clone()) {
-                Ok(c) => c,
-                Err(err) => {
-                    warn!(app = %id, %err, "skipping invalid webhook config entry");
-                    continue;
-                }
-            };
-            targets.push(CompiledTarget {
-                app_id: id.as_str().to_string(),
-                app_key: app.key.as_str().to_string(),
-                app_secret: app.secret.clone(),
-                url: cfg.url,
-                event_filter: cfg.event_types,
-                channel_prefix: cfg.filter_by_prefix,
-            });
-        }
-        if !targets.is_empty() {
-            map.insert(id.as_str().to_string(), targets);
-        }
+    let mut targets = Vec::new();
+    for raw in &app.webhooks {
+        let cfg: WebhookConfig = match serde_json::from_value(raw.clone()) {
+            Ok(c) => c,
+            Err(err) => {
+                warn!(app = %app.id, %err, "skipping invalid webhook config entry");
+                continue;
+            }
+        };
+        targets.push(CompiledTarget {
+            app_id: app.id.as_str().to_string(),
+            app_key: app.key.as_str().to_string(),
+            app_secret: app.secret.clone(),
+            url: cfg.url,
+            event_filter: cfg.event_types,
+            channel_prefix: cfg.filter_by_prefix,
+        });
     }
-    map
+    targets
 }
