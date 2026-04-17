@@ -1,0 +1,91 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/zatat-core",
+    "crates/zatat-config",
+    "crates/zatat-protocol",
+    "crates/zatat-connection",
+    "crates/zatat-channels",
+    "crates/zatat-ws",
+    "crates/zatat-cli",
+    "crates/zatat-http",
+    "crates/zatat-scaling",
+    "crates/zatat-metrics",
+    "crates/zatat-webhooks",
+]
+# fuzz/ needs nightly and libfuzzer-sys (Linux-only).
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+
+[workspace.dependencies]
+tokio = { version = "1.40", features = ["full"] }
+thiserror = "1"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+figment = { version = "0.10", features = ["toml", "env"] }
+toml = "0.8"
+hmac = "0.12"
+sha2 = "0.10"
+md-5 = "0.10"
+hex = "0.4"
+subtle = "2.5"
+crypto_secretbox = { version = "0.1", default-features = false, features = ["salsa20", "alloc", "getrandom"] }
+base64 = "0.22"
+dashmap = "6"
+parking_lot = "0.12"
+arc-swap = "1.7"
+rand = "0.8"
+globset = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+axum = { version = "0.7", features = ["ws", "macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+bytes = "1"
+tokio-rustls = "0.26"
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pemfile = "2"
+axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
+fred = { version = "9", default-features = false, features = ["subscriber-client", "network-logs"] }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+futures = "0.3"
+async-trait = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+zatat-core = { path = "crates/zatat-core" }
+zatat-config = { path = "crates/zatat-config" }
+zatat-protocol = { path = "crates/zatat-protocol" }
+zatat-connection = { path = "crates/zatat-connection" }
+zatat-channels = { path = "crates/zatat-channels" }
+zatat-ws = { path = "crates/zatat-ws" }
+zatat-http = { path = "crates/zatat-http" }
+zatat-scaling = { path = "crates/zatat-scaling" }
+zatat-metrics = { path = "crates/zatat-metrics" }
+zatat-webhooks = { path = "crates/zatat-webhooks" }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+[profile.bench]
+inherits = "release"
+debug = true
+strip = "none"

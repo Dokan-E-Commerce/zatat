@@ -1,0 +1,45 @@
+[package]
+name = "zatat-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+serde_json = "1"
+zatat-protocol = { path = "../crates/zatat-protocol" }
+
+[[bin]]
+name = "parse_inbound"
+path = "fuzz_targets/parse_inbound.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "verify_http"
+path = "fuzz_targets/verify_http.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decrypt_payload"
+path = "fuzz_targets/decrypt_payload.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "presence_from_members"
+path = "fuzz_targets/presence_from_members.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = true

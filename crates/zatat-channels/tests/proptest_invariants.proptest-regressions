@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 13e2caf593f4629ea1634558c0708473b1635fc6a9ccf20fe1e622eaed350336 # shrinks to ops = [Sub { socket: 2, channel: 0, user: 0 }, Broadcast { channel: 0, except: None }, Broadcast { channel: 0, except: Some(2) }]

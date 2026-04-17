@@ -1,0 +1,15 @@
+[package]
+name = "zatat-metrics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+zatat-core.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+subtle.workspace = true
+hyper.workspace = true

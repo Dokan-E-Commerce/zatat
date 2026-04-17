@@ -1,0 +1,72 @@
+# Example configuration for zatat.
+#
+# Every field has a sensible default; trim this file down to what you actually
+# need. Any field can be overridden by an environment variable using the
+# `ZATAT_` prefix with `__` separating nested fields:
+#
+#   ZATAT_SERVER__PORT=9090
+#   ZATAT_SERVER__SCALING__ENABLED=true
+#   ZATAT_APPS__0__SECRET=hunter2
+
+[server]
+host = "0.0.0.0"
+port = 8080
+# Prefix every route with this path (e.g. "/realtime"). Empty = serve at root.
+path = ""
+# Optional hostname for logging and default scaling-channel names.
+hostname = "realtime.example.com"
+max_request_size = 10000
+
+# Sentinel file polled by the running server. Touching it triggers a graceful
+# shutdown — `zatat restart` does exactly this.
+restart_signal_file = "/tmp/zatat.restart"
+restart_poll_interval_seconds = 5
+
+# Prometheus metrics endpoint. Bound to loopback with no auth by default, so
+# only local scrapers can reach it. If you bind to a non-loopback address,
+# `bearer_token` is required — the server refuses to start otherwise.
+# [server.prometheus]
+# listen = "127.0.0.1:9090"
+# bearer_token = "generate-a-long-random-string-here"
+
+# Terminate TLS directly in the server. Most deployments terminate at the
+# reverse proxy instead.
+# [server.tls]
+# cert = "/etc/zatat/cert.pem"
+# key = "/etc/zatat/key.pem"
+
+# Horizontal scaling over Redis pub/sub. All nodes subscribe to the same
+# channel; events published on one node are rebroadcast on every other.
+# [server.scaling]
+# enabled = true
+# channel = "zatat"
+#
+# [server.scaling.redis]
+# # Either set `url` OR the discrete host/port/... fields.
+# # url = "redis://user:pass@host:6379/0"
+# host = "127.0.0.1"
+# port = 6379
+# db = 0
+# # username = "..."
+# # password = "..."
+# timeout_seconds = 60
+
+# One `[[apps]]` block per tenant.
+[[apps]]
+id = "app-1"
+key = "app-key-1"
+secret = "app-secret-1"
+ping_interval = 30
+activity_timeout = 30
+allowed_origins = ["*"]          # or ["app.example.com", "*.example.com"]
+max_message_size = 10000
+# max_connections = 10000        # omit for unlimited
+# Who's allowed to send client-* events: "all" | "members" | "none"
+accept_client_events_from = "members"
+
+# Optional: drop (or terminate) clients that exceed a sliding rate limit.
+# [apps.rate_limiting]
+# enabled = true
+# max_attempts = 60
+# decay_seconds = 60
+# terminate_on_limit = false

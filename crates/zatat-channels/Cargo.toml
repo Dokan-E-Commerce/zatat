@@ -1,0 +1,18 @@
+[package]
+name = "zatat-channels"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+zatat-core.workspace = true
+zatat-connection.workspace = true
+zatat-protocol.workspace = true
+dashmap.workspace = true
+parking_lot.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+proptest = "1"
+tokio = { workspace = true, features = ["full"] }

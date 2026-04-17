@@ -1,0 +1,11 @@
+[package]
+name = "zatat-connection"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+zatat-core.workspace = true
+tokio.workspace = true
+parking_lot.workspace = true

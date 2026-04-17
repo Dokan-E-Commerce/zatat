@@ -1,0 +1,13 @@
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[[apps]]
+id     = "bench"
+key    = "bench-key"
+secret = "bench-secret"
+allowed_origins = ["*"]
+ping_interval = 60
+activity_timeout = 60
+max_message_size = 10000
+accept_client_events_from = "all"

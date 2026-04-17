@@ -1,0 +1,25 @@
+[package]
+name = "zatat-scaling"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+zatat-core.workspace = true
+zatat-connection.workspace = true
+zatat-channels.workspace = true
+zatat-config.workspace = true
+zatat-protocol.workspace = true
+zatat-webhooks.workspace = true
+tokio.workspace = true
+tokio-stream = "0.1"
+async-trait.workspace = true
+fred.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+dashmap.workspace = true
+parking_lot.workspace = true
