@@ -82,7 +82,7 @@ fn canonical_http_string(
         filtered.push(("body_md5".into(), digest));
     }
 
-    filtered.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    filtered.sort_by_key(|a| a.0.to_lowercase());
     let qs = filtered
         .iter()
         .map(|(k, v)| format!("{k}={v}"))
