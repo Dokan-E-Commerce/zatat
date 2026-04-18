@@ -77,6 +77,15 @@ impl Channel {
         }
     }
 
+    /// Whether `user_id` has at least one local connection in this presence
+    /// channel. Returns `false` on non-presence channels.
+    pub fn has_user_id(&self, user_id: &str) -> bool {
+        self.user_refcounts
+            .as_ref()
+            .map(|refs| refs.contains_key(user_id))
+            .unwrap_or(false)
+    }
+
     pub fn has_cached_payload(&self) -> bool {
         self.cached_payload().is_some()
     }

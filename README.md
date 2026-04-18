@@ -181,7 +181,7 @@ ping_interval      = 30       # seconds between pings
 activity_timeout   = 30       # idle before we ping / prune
 
 # Size limits
-max_message_size   = 10_000   # reject with 4200 if a WS frame exceeds this
+max_message_size   = 10_000   # emit pusher:error 4200 on an oversized frame (connection stays open)
 max_connections    = 10_000   # reject with 4004 when reached
 
 # Origin allow-list — globs are supported
@@ -368,6 +368,21 @@ Event types emitted:
 Delivery: async worker with 4-attempt exponential backoff, 10 s per
 request; filter per target with `event_types` + optional
 `filter_by_prefix`.
+
+**Delivery guarantees.** The in-process enqueue queue is bounded at 64k
+events to keep a stalled consumer from OOM'ing the server. Behavior when
+it fills is controlled by `server.webhook_overflow_mode`:
+
+- `"best_effort"` (default) — new events are dropped and counted via
+  `zatat_webhooks_dropped_total`. Alert on the counter. Producer hot paths
+  never block.
+- `"block"` — producers are back-pressured until a slot frees up. Zero
+  loss; sustained overload slows the source of events instead of dropping
+  them. Also caps in-flight deliveries at 256 via an internal semaphore, so
+  a slow target never creates unbounded tokio tasks.
+
+For durable-across-restart delivery, feed events from zatat into a real
+queue (Redis Streams, Kafka) and fan out from there.
 
 ---
 

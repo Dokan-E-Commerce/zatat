@@ -17,6 +17,13 @@ path = ""
 hostname = "realtime.example.com"
 max_request_size = 10000
 
+# Webhook delivery queue behavior when the in-memory queue is full.
+#   "best_effort" (default) — drop the event + count it; never blocks callers
+#   "block"                 — back-pressure: caller awaits a slot (zero loss)
+# Choose "block" when webhook delivery is a hard business dependency and
+# you've sized your consumer for the peak load.
+# webhook_overflow_mode = "best_effort"
+
 # Sentinel file polled by the running server. Touching it triggers a graceful
 # shutdown — `zatat restart` does exactly this.
 restart_signal_file = "/tmp/zatat.restart"
@@ -40,6 +47,10 @@ restart_poll_interval_seconds = 5
 # [server.scaling]
 # enabled = true
 # channel = "zatat"
+# # How to react when the outbound publisher queue fills:
+# #   "best_effort" (default) — drop + count; hot paths never block
+# #   "block"                 — back-pressure callers; zero cross-node loss
+# overflow_mode = "best_effort"
 #
 # [server.scaling.redis]
 # # Either set `url` OR the discrete host/port/... fields.

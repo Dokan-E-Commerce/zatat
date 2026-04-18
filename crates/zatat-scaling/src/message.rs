@@ -71,6 +71,64 @@ pub enum ScalingPayload {
         node_id: String,
         channels: Vec<ChannelMetric>,
     },
+    /// A presence `user_id` newly appeared on the origin node.
+    /// Receivers dedupe against local + other-peer caches and only emit
+    /// `pusher_internal:member_added` if this is the user's first global
+    /// appearance in the channel.
+    MemberAdded {
+        origin_node_id: String,
+        channel: String,
+        user_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_info: Option<Value>,
+    },
+    /// A presence `user_id` vanished from the origin node.
+    /// Receivers only emit `pusher_internal:member_removed` if, after this
+    /// removal is applied, the user no longer exists anywhere globally.
+    MemberRemoved {
+        origin_node_id: String,
+        channel: String,
+        user_id: String,
+    },
+    /// A non-presence channel's subscription count changed on the origin
+    /// node. Receivers update their per-peer count tracker and emit
+    /// `pusher_internal:subscription_count` with the aggregated total.
+    SubscriptionCount {
+        origin_node_id: String,
+        channel: String,
+        count: usize,
+    },
+    /// A user's first socket on the origin node came online.
+    /// Receivers dedupe against other-peer caches + local state and emit a
+    /// watchlist `online` event only on a global 0→1 transition.
+    UserOnline {
+        origin_node_id: String,
+        user_id: String,
+    },
+    /// The user's last socket on the origin node went away. Receivers
+    /// emit `offline` only on a global 1→0 transition.
+    UserOffline {
+        origin_node_id: String,
+        user_id: String,
+    },
+    /// Periodic reconciliation snapshot — sub counts per non-presence channel.
+    /// Safety net in case a live `SubscriptionCount` event was lost.
+    ChannelCountSnapshot {
+        node_id: String,
+        counts: Vec<ChannelCount>,
+    },
+    /// Periodic reconciliation snapshot — signed-in users per node.
+    /// Safety net for UserOnline/UserOffline events.
+    UserSessionSnapshot {
+        node_id: String,
+        user_ids: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChannelCount {
+    pub channel: String,
+    pub count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,5 +241,74 @@ mod tests {
         let s = r#"{"v":99,"app":{"id":"a","key":"k"},"type":"terminate","socket_id":"1.2"}"#;
         let back: ScalingEnvelope = serde_json::from_str(s).unwrap();
         assert_eq!(back.version, 99);
+    }
+
+    #[test]
+    fn round_trip_member_added_and_removed() {
+        for p in [
+            ScalingPayload::MemberAdded {
+                origin_node_id: "n1".into(),
+                channel: "presence-x".into(),
+                user_id: "u".into(),
+                user_info: Some(serde_json::json!({"name": "U"})),
+            },
+            ScalingPayload::MemberRemoved {
+                origin_node_id: "n1".into(),
+                channel: "presence-x".into(),
+                user_id: "u".into(),
+            },
+        ] {
+            let env = ScalingEnvelope {
+                version: SCALING_VERSION,
+                app: AppRef {
+                    id: "a".into(),
+                    key: "k".into(),
+                },
+                payload: p,
+            };
+            let s = serde_json::to_string(&env).unwrap();
+            let _back: ScalingEnvelope = serde_json::from_str(&s).unwrap();
+        }
+    }
+
+    #[test]
+    fn round_trip_subscription_count_and_user_events() {
+        for p in [
+            ScalingPayload::SubscriptionCount {
+                origin_node_id: "n1".into(),
+                channel: "room".into(),
+                count: 17,
+            },
+            ScalingPayload::UserOnline {
+                origin_node_id: "n1".into(),
+                user_id: "u".into(),
+            },
+            ScalingPayload::UserOffline {
+                origin_node_id: "n1".into(),
+                user_id: "u".into(),
+            },
+            ScalingPayload::ChannelCountSnapshot {
+                node_id: "n1".into(),
+                counts: vec![ChannelCount {
+                    channel: "room".into(),
+                    count: 3,
+                }],
+            },
+            ScalingPayload::UserSessionSnapshot {
+                node_id: "n1".into(),
+                user_ids: vec!["u".into(), "v".into()],
+            },
+        ] {
+            let env = ScalingEnvelope {
+                version: SCALING_VERSION,
+                app: AppRef {
+                    id: "a".into(),
+                    key: "k".into(),
+                },
+                payload: p,
+            };
+            let s = serde_json::to_string(&env).unwrap();
+            let _back: ScalingEnvelope = serde_json::from_str(&s).unwrap();
+        }
     }
 }

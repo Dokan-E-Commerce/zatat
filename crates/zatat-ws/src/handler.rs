@@ -192,6 +192,12 @@ pub async fn run_connection(
                             }
                             Ok(None) => {}
                             Err(ControlFlow::Close) => break,
+                            Err(ControlFlow::CloseWith { code, reason }) => {
+                                let frame = outbound::error_with_message(code, &reason);
+                                let _ = sink.send(Message::Text(frame)).await;
+                                let _ = sink.send(pusher_close(code, &reason)).await;
+                                break;
+                            }
                         }
                     }
                     Some(Ok(Message::Ping(p))) => {
@@ -221,6 +227,10 @@ pub async fn run_connection(
 enum ControlFlow {
     #[allow(dead_code)]
     Close,
+    /// Send a `pusher:error` with the given code, then close the WS with
+    /// the same code and reason. Used for fatal handshake-level errors that
+    /// the client must surface (e.g. watchlist limit, Pusher error 4302).
+    CloseWith { code: u16, reason: String },
 }
 
 async fn handle_inbound(
@@ -274,6 +284,7 @@ async fn handle_subscribe(
             return Ok(Some(outbound::error(&PusherError::Unauthorized)));
         };
         if verify_channel_auth(
+            app.key.as_str(),
             conn.socket_id.as_str(),
             channel_name,
             channel_data,
@@ -370,6 +381,16 @@ async fn handle_subscribe(
                     user_id: pm.user_id.clone(),
                 },
             );
+            // Only emit member_added if this user_id is not already known
+            // on another peer node (else it's a user's second device, and
+            // `member_added` would be a duplicate). Always publish to the
+            // scaling bus so peers can dedupe and emit if needed.
+            let already_remotely_present = state.dispatcher.presence_cache().is_present_excluding(
+                app.id.as_str(),
+                channel_name,
+                &pm.user_id,
+                None,
+            );
             // Defer so the joining client's subscription_succeeded flushes first.
             let channels = state.channels.clone();
             let app_id = app.id.clone();
@@ -379,6 +400,9 @@ async fn handle_subscribe(
             let user_info = pm.user_info.clone();
             tokio::spawn(async move {
                 tokio::task::yield_now().await;
+                if already_remotely_present {
+                    return;
+                }
                 let frame =
                     outbound::member_added(&channel_name_cloned, &user_id, user_info.as_ref());
                 if let Some(ch) = channels.find_channel(&app_id, &channel_name_cloned) {
@@ -386,12 +410,25 @@ async fn handle_subscribe(
                     ch.broadcast_protocol(arc, Some(&sender));
                 }
             });
+            // Always propagate to peer nodes — they'll dedupe against their
+            // own local+remote state before emitting.
+            state.dispatcher.publish_member_added(
+                app,
+                channel_name.to_string(),
+                pm.user_id.clone(),
+                pm.user_info.clone(),
+            );
         }
     }
 
     if app.emit_subscription_count && !kind.is_presence() {
-        let count = outcome.member_count;
-        let frame = outbound::subscription_count(channel_name, count);
+        let local_count = outcome.member_count;
+        let peer_sum = state
+            .dispatcher
+            .peer_channel_counts()
+            .sum(app.id.as_str(), channel_name);
+        let total = local_count + peer_sum;
+        let frame = outbound::subscription_count(channel_name, total);
         if let Some(ch) = state.channels.find_channel(&app.id, channel_name) {
             let arc: Arc<str> = Arc::from(frame.into_boxed_str());
             ch.broadcast_protocol(arc, None);
@@ -400,9 +437,12 @@ async fn handle_subscribe(
             app.id.as_str(),
             WebhookEvent::SubscriptionCount {
                 channel: channel_name.to_string(),
-                count,
+                count: total,
             },
         );
+        state
+            .dispatcher
+            .publish_subscription_count(app, channel_name.to_string(), local_count);
     }
 
     Ok(Some(succeeded))
@@ -425,10 +465,20 @@ async fn handle_unsubscribe(
         let kind = ChannelKind::from_name(channel_name);
         if outcome.was_member && kind.is_presence() {
             if let Some(user_id) = outcome.user_removed.as_deref() {
-                let frame = outbound::member_removed(channel_name, user_id);
-                if let Some(ch) = state.channels.find_channel(&app.id, channel_name) {
-                    let arc: Arc<str> = Arc::from(frame.into_boxed_str());
-                    ch.broadcast_protocol(arc, None);
+                // Only emit local member_removed if this user isn't still
+                // online on any peer. Always publish so peers can dedupe.
+                let still_remotely = state.dispatcher.presence_cache().is_present_excluding(
+                    app.id.as_str(),
+                    channel_name,
+                    user_id,
+                    None,
+                );
+                if !still_remotely {
+                    let frame = outbound::member_removed(channel_name, user_id);
+                    if let Some(ch) = state.channels.find_channel(&app.id, channel_name) {
+                        let arc: Arc<str> = Arc::from(frame.into_boxed_str());
+                        ch.broadcast_protocol(arc, None);
+                    }
                 }
                 state.webhooks.enqueue(
                     app.id.as_str(),
@@ -437,11 +487,21 @@ async fn handle_unsubscribe(
                         user_id: user_id.to_string(),
                     },
                 );
+                state.dispatcher.publish_member_removed(
+                    app,
+                    channel_name.to_string(),
+                    user_id.to_string(),
+                );
             }
         }
         if outcome.was_member && app.emit_subscription_count && !kind.is_presence() {
-            let count = outcome.member_count;
-            let frame = outbound::subscription_count(channel_name, count);
+            let local_count = outcome.member_count;
+            let peer_sum = state
+                .dispatcher
+                .peer_channel_counts()
+                .sum(app.id.as_str(), channel_name);
+            let total = local_count + peer_sum;
+            let frame = outbound::subscription_count(channel_name, total);
             if let Some(ch) = state.channels.find_channel(&app.id, channel_name) {
                 let arc: Arc<str> = Arc::from(frame.into_boxed_str());
                 ch.broadcast_protocol(arc, None);
@@ -450,9 +510,12 @@ async fn handle_unsubscribe(
                 app.id.as_str(),
                 WebhookEvent::SubscriptionCount {
                     channel: channel_name.to_string(),
-                    count,
+                    count: total,
                 },
             );
+            state
+                .dispatcher
+                .publish_subscription_count(app, channel_name.to_string(), local_count);
         }
         if outcome.member_count == 0 {
             state.webhooks.enqueue(
@@ -480,7 +543,15 @@ async fn handle_signin(
     let Some(user_data) = data_obj.get("user_data").and_then(|v| v.as_str()) else {
         return Ok(Some(outbound::error(&PusherError::Unauthorized)));
     };
-    if verify_user_auth(conn.socket_id.as_str(), user_data, auth, &app.secret).is_err() {
+    if verify_user_auth(
+        app.key.as_str(),
+        conn.socket_id.as_str(),
+        user_data,
+        auth,
+        &app.secret,
+    )
+    .is_err()
+    {
         return Ok(Some(outbound::error(&PusherError::Unauthorized)));
     }
     let parsed: Value = serde_json::from_str(user_data).unwrap_or(Value::Null);
@@ -494,30 +565,57 @@ async fn handle_signin(
     if user_id.is_empty() {
         return Ok(Some(outbound::error(&PusherError::InvalidMessageFormat)));
     }
-    let was_online = state.channels.is_user_online(&app.id, &user_id);
-    conn.bind_user(user_id.clone());
-    state.channels.bind_user(&app.id, &user_id, &conn.socket_id);
-
-    // Watchlist lives inside user_data, not at the signin payload's top level.
+    // Validate the watchlist BEFORE binding — oversized input must fail
+    // atomically, not leave the user half-registered (online in the user
+    // index, advertised to peers, but with the client seeing an error).
     let watchlist_value = parsed.get("watchlist").cloned();
-    if let Some(Value::Array(arr)) = watchlist_value {
-        if arr.len() > 100 {
-            return Ok(Some(outbound::error_with_message(
-                4302,
-                "Watchlist exceeds 100 users",
-            )));
+    let watchlist_list: Option<Vec<String>> = match watchlist_value {
+        None => None,
+        Some(Value::Array(arr)) => {
+            if arr.len() > 100 {
+                // Pusher spec + docs: oversized watchlist is a fatal signin
+                // error — send pusher:error 4302 AND close the WS with 4302
+                // so the client's onError/onClose surfaces it properly.
+                return Err(ControlFlow::CloseWith {
+                    code: 4302,
+                    reason: "Watchlist exceeds 100 users".into(),
+                });
+            }
+            Some(
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect(),
+            )
         }
-        let list: Vec<String> = arr
-            .iter()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect();
+        Some(_) => {
+            return Ok(Some(outbound::error(&PusherError::InvalidMessageFormat)));
+        }
+    };
+
+    let was_online_locally = state.channels.is_user_online(&app.id, &user_id);
+    let was_online_remotely =
+        state
+            .dispatcher
+            .peer_user_sessions()
+            .is_present_excluding(app.id.as_str(), &user_id, None);
+    conn.bind_user(user_id.clone());
+    let first_local_socket = state.channels.bind_user(&app.id, &user_id, &conn.socket_id);
+
+    if let Some(list) = watchlist_list {
         conn.set_watchlist(list.clone());
         for watched in &list {
             state.channels.add_watcher(&app.id, watched, &user_id);
         }
         let online: Vec<String> = list
             .iter()
-            .filter(|u| state.channels.is_user_online(&app.id, u))
+            .filter(|u| {
+                state.channels.is_user_online(&app.id, u)
+                    || state.dispatcher.peer_user_sessions().is_present_excluding(
+                        app.id.as_str(),
+                        u,
+                        None,
+                    )
+            })
             .cloned()
             .collect();
         // pusher-js requires `data.events` to be an array of `{name, user_ids}`.
@@ -534,9 +632,15 @@ async fn handle_signin(
         let _ = handle.try_send(Outbound::Text(Arc::from(frame.into_boxed_str())));
     }
 
-    if !was_online {
+    // Global 0→1 transition: emit "online" to local watchers.
+    if !was_online_locally && !was_online_remotely {
         fanout_watchlist_event(state, app, &user_id, "online").await;
     }
+    // First socket for this user on this node → tell peers.
+    if first_local_socket {
+        state.dispatcher.publish_user_online(app, user_id.clone());
+    }
+    let _ = was_online_locally;
 
     Ok(Some(outbound::signin_success(user_data)))
 }
@@ -568,13 +672,9 @@ async fn handle_client_event(
     {
         return Ok(Some(outbound::error(&PusherError::NotChannelMember)));
     }
-    if matches!(
-        app.accept_client_events_from,
-        AcceptClientEventsFrom::Members
-    ) && !kind.is_private()
-    {
-        return Ok(Some(outbound::error(&PusherError::ClientEventsDisabled)));
-    }
+    // Note: non-private channels already rejected above (line ~640); no
+    // further Members-vs-All distinction is needed here because Pusher spec
+    // only allows client events on private/presence channels regardless.
     let data_str = match &frame.data {
         Value::String(s) => s.clone(),
         v => v.to_string(),
@@ -586,6 +686,20 @@ async fn handle_client_event(
     );
     let arc: Arc<str> = Arc::from(encoded.into_boxed_str());
     channel.broadcast(arc, Some(&conn.socket_id));
+
+    // Fan out to peer nodes via the scaling bus so tabs connected to other
+    // zatat nodes behind the LB also see this event. Without this, two tabs
+    // hashed to different nodes never see each other's client-* frames.
+    state
+        .dispatcher
+        .publish_client_event(
+            app,
+            channel_name.to_string(),
+            event.to_string(),
+            data_str.clone(),
+            conn.socket_id.clone(),
+        )
+        .await;
 
     state.webhooks.enqueue(
         app.id.as_str(),
@@ -644,10 +758,18 @@ async fn cleanup_connection(
         if let Some(outcome) = state.channels.unsubscribe(&app.id, &name, socket_id) {
             if outcome.was_member && kind.is_presence() {
                 if let Some(user_id) = outcome.user_removed.as_deref() {
-                    let frame = outbound::member_removed(&name, user_id);
-                    if let Some(live) = state.channels.find_channel(&app.id, &name) {
-                        let arc: Arc<str> = Arc::from(frame.into_boxed_str());
-                        live.broadcast_protocol(arc, None);
+                    let still_remotely = state.dispatcher.presence_cache().is_present_excluding(
+                        app.id.as_str(),
+                        &name,
+                        user_id,
+                        None,
+                    );
+                    if !still_remotely {
+                        let frame = outbound::member_removed(&name, user_id);
+                        if let Some(live) = state.channels.find_channel(&app.id, &name) {
+                            let arc: Arc<str> = Arc::from(frame.into_boxed_str());
+                            live.broadcast_protocol(arc, None);
+                        }
                     }
                     state.webhooks.enqueue(
                         app.id.as_str(),
@@ -656,12 +778,20 @@ async fn cleanup_connection(
                             user_id: user_id.to_string(),
                         },
                     );
+                    state
+                        .dispatcher
+                        .publish_member_removed(app, name.clone(), user_id.to_string());
                 }
             }
             if outcome.was_member && app.emit_subscription_count && !kind.is_presence() {
-                let count = outcome.member_count;
+                let local_count = outcome.member_count;
+                let peer_sum = state
+                    .dispatcher
+                    .peer_channel_counts()
+                    .sum(app.id.as_str(), &name);
+                let total = local_count + peer_sum;
                 if let Some(live) = state.channels.find_channel(&app.id, &name) {
-                    let frame = outbound::subscription_count(&name, count);
+                    let frame = outbound::subscription_count(&name, total);
                     let arc: Arc<str> = Arc::from(frame.into_boxed_str());
                     live.broadcast_protocol(arc, None);
                 }
@@ -669,9 +799,12 @@ async fn cleanup_connection(
                     app.id.as_str(),
                     WebhookEvent::SubscriptionCount {
                         channel: name.clone(),
-                        count,
+                        count: total,
                     },
                 );
+                state
+                    .dispatcher
+                    .publish_subscription_count(app, name.clone(), local_count);
             }
             if outcome.member_count == 0 {
                 state.webhooks.enqueue(
@@ -684,7 +817,16 @@ async fn cleanup_connection(
     if let Some(user_id) = conn.user_id() {
         let last_socket = state.channels.unbind_user(&app.id, &user_id, socket_id);
         if last_socket {
-            fanout_watchlist_event(state, app, &user_id, "offline").await;
+            // Only fire offline to local watchers if user isn't online on any peer.
+            let still_remotely = state.dispatcher.peer_user_sessions().is_present_excluding(
+                app.id.as_str(),
+                &user_id,
+                None,
+            );
+            if !still_remotely {
+                fanout_watchlist_event(state, app, &user_id, "offline").await;
+            }
+            state.dispatcher.publish_user_offline(app, user_id.clone());
             state.channels.remove_all_watches_for(&app.id, &user_id);
         }
     }

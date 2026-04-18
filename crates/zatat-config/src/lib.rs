@@ -112,6 +112,10 @@ pub struct ServerConfig {
     pub tls: Option<TlsConfig>,
     pub scaling: Option<ScalingConfig>,
     pub prometheus: Option<PrometheusConfig>,
+    /// `"best_effort"` (default, drop on full) or `"block"` (back-pressure).
+    /// Controls how the webhook dispatcher reacts when its in-memory queue
+    /// fills. Set to `"block"` when webhook delivery is business-critical.
+    pub webhook_overflow_mode: OverflowMode,
 }
 
 #[derive(Clone, Debug)]
@@ -125,6 +129,24 @@ pub struct ScalingConfig {
     pub enabled: bool,
     pub channel: String,
     pub redis: RedisConfig,
+    /// How the outbound publisher reacts when the in-memory queue is full.
+    /// `BestEffort` (default) drops the payload + counts it via
+    /// `zatat_scaling_publish_drops_total`. `Block` makes callers await a
+    /// free slot — zero-loss, at the cost of slowing the producer.
+    pub overflow_mode: OverflowMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum OverflowMode {
+    /// Drop excess work + count it; never blocks the producer. Default,
+    /// safe for every workload.
+    #[default]
+    BestEffort,
+    /// Back-pressure: the producer awaits a free slot. Zero loss, but a
+    /// sustained overload will slow every caller of the affected queue.
+    /// Choose this when the downstream consumer (webhook receiver, Redis)
+    /// is a hard business dependency.
+    Block,
 }
 
 #[derive(Clone, Debug)]
@@ -174,6 +196,8 @@ struct RawServer {
     scaling: Option<RawScaling>,
     #[serde(default)]
     prometheus: Option<RawPrometheus>,
+    #[serde(default)]
+    webhook_overflow_mode: RawOverflowMode,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -190,6 +214,26 @@ struct RawScaling {
     channel: String,
     #[serde(default)]
     redis: RawRedis,
+    /// `"best_effort"` (default, drops on full) or `"block"` (back-pressure).
+    #[serde(default)]
+    overflow_mode: RawOverflowMode,
+}
+
+#[derive(Deserialize, Serialize, Debug, Default)]
+#[serde(rename_all = "snake_case")]
+enum RawOverflowMode {
+    #[default]
+    BestEffort,
+    Block,
+}
+
+impl From<RawOverflowMode> for OverflowMode {
+    fn from(r: RawOverflowMode) -> Self {
+        match r {
+            RawOverflowMode::BestEffort => OverflowMode::BestEffort,
+            RawOverflowMode::Block => OverflowMode::Block,
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug, Default)]
@@ -315,11 +359,13 @@ impl RawConfig {
                     password: s.redis.password,
                     timeout_seconds: s.redis.timeout_seconds,
                 },
+                overflow_mode: s.overflow_mode.into(),
             }),
             prometheus: self.server.prometheus.map(|p| PrometheusConfig {
                 listen: p.listen,
                 bearer_token: p.bearer_token,
             }),
+            webhook_overflow_mode: self.server.webhook_overflow_mode.into(),
         };
 
         let index = RawConfig {

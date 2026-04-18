@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{ConnectInfo, Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
@@ -43,19 +43,46 @@ async fn ws_upgrade(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
+    // Pusher protocol contract: surface rejections as WS close codes, not
+    // pre-upgrade HTTP. Browsers see HTTP 401/400 pre-upgrade as a generic
+    // "connection failed"; they only surface the Pusher error code when the
+    // WS has already been upgraded. So for every rejection path we do a
+    // bare upgrade and immediately close with the right code.
+
+    // 4001: application not found.
     let app = match state.config.app_by_key(&AppKey::from(app_key.clone())) {
         Some(app) => app,
         None => {
-            warn!(app_key = %app_key, "rejected connection: unknown app_key");
-            return (StatusCode::UNAUTHORIZED, "Application does not exist").into_response();
+            warn!(app_key = %app_key, "rejected connection: unknown app_key (sending 4001)");
+            let app_key_owned = app_key.clone();
+            return ws.on_upgrade(move |socket| async move {
+                crate::handler::run_rejected_connection(
+                    socket,
+                    4001,
+                    format!("Application does not exist for key '{app_key_owned}'"),
+                )
+                .await;
+            });
         }
     };
+
+    // 4007: unsupported Pusher protocol version.
     if let Some(protocol) = q.protocol.as_deref() {
         match protocol {
             "5" | "6" | "7" => {}
             other => {
-                warn!(app = %app.id, protocol = %other, "rejected: unsupported protocol");
-                return (StatusCode::BAD_REQUEST, "Unsupported protocol version").into_response();
+                warn!(app = %app.id, protocol = %other, "rejected: unsupported protocol (sending 4007)");
+                let protocol_owned = other.to_string();
+                return ws.on_upgrade(move |socket| async move {
+                    crate::handler::run_rejected_connection(
+                        socket,
+                        4007,
+                        format!(
+                            "Unsupported protocol version '{protocol_owned}' — server supports 5, 6, 7",
+                        ),
+                    )
+                    .await;
+                });
             }
         }
     }
@@ -84,10 +111,6 @@ async fn ws_upgrade(
         );
     }
 
-    // Pusher protocol contract: upgrade the WS first, THEN deliver any
-    // connection-refusal as a `pusher:error` frame. That's the only way a
-    // browser-side pusher-js client ever surfaces the reason — an HTTP
-    // 403 pre-upgrade looks to JS like a generic "WS failed".
     let origin_for_msg = origin.clone();
     ws.on_upgrade(move |socket| async move {
         if origin_blocked {

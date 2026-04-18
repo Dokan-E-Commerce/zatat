@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{delete, get, post};
@@ -30,6 +30,10 @@ pub struct ApiStateInner {
 }
 
 pub fn build_api_router(state: ApiState) -> Router {
+    // `server.max_request_size` caps inbound HTTP bodies. Applied as a
+    // router-level layer so axum rejects oversized bodies with 413 before
+    // the handler sees them (and before we try to MD5/verify/parse).
+    let max_body = state.config.server.max_request_size as usize;
     Router::new()
         .route("/apps/:app_id/events", post(publish_event))
         .route("/apps/:app_id/batch_events", post(publish_batch_events))
@@ -42,6 +46,7 @@ pub fn build_api_router(state: ApiState) -> Router {
             "/apps/:app_id/users/:user_id/terminate_connections",
             post(terminate_user_pusher),
         )
+        .layer(DefaultBodyLimit::max(max_body))
         .with_state(state)
 }
 
@@ -201,6 +206,12 @@ async fn publish_batch_events(
 
     let payload: BatchEventsPayload =
         serde_json::from_slice(&body).map_err(|e| ApiError(422, format!("invalid body: {e}")))?;
+    if payload.batch.is_empty() {
+        return Err(ApiError(
+            400,
+            "batch must contain at least one event".into(),
+        ));
+    }
     for ev in &payload.batch {
         validate_event_payload(ev)?;
     }
@@ -250,13 +261,29 @@ async fn dispatch_event(state: &ApiState, app: &AppArc, ev: EventPayload) {
 }
 
 fn validate_event_payload(ev: &EventPayload) -> Result<(), ApiError> {
+    if ev.name.is_empty() {
+        return Err(ApiError(400, "event name is required".into()));
+    }
     if ev.name.len() > MAX_EVENT_NAME_LEN {
         return Err(ApiError(
             422,
             format!("event name exceeds {MAX_EVENT_NAME_LEN} bytes"),
         ));
     }
-    for ch in event_channels(ev) {
+    let channels = event_channels(ev);
+    if channels.is_empty() {
+        // Publishing with no target is a publisher contract violation — do
+        // NOT silently 200. Pusher's docs require at least one of `channel`
+        // or `channels`.
+        return Err(ApiError(
+            400,
+            "event must specify `channel` or `channels`".into(),
+        ));
+    }
+    for ch in channels {
+        if ch.is_empty() {
+            return Err(ApiError(400, "channel name must not be empty".into()));
+        }
         if ch.len() > MAX_CHANNEL_NAME_LEN {
             return Err(ApiError(
                 422,

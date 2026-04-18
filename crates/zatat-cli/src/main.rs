@@ -15,6 +15,46 @@ use zatat_config::Config;
 use zatat_scaling::{LocalOnlyProvider, RedisPubSubProvider};
 use zatat_ws::state::{ServerState, ServerStateInner};
 
+/// Supervisor: re-spawn `make_task()` when the previous run ends (either
+/// normally OR via a caught panic). Emits a metric + warn log on each
+/// respawn so operators can alert on flapping. Exponential backoff caps
+/// at 30s so a persistent bug doesn't busy-loop.
+fn supervise<F, Fut>(name: &'static str, make_task: F)
+where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut backoff_ms: u64 = 500;
+        loop {
+            let jh = tokio::spawn(make_task());
+            match jh.await {
+                Ok(()) => {
+                    warn!(task = name, "supervised task exited cleanly; respawning");
+                    metrics::counter!("zatat_supervisor_respawns_total", "task" => name)
+                        .increment(1);
+                }
+                Err(e) if e.is_panic() => {
+                    warn!(
+                        task = name,
+                        "supervised task PANICKED; respawning in {backoff_ms}ms"
+                    );
+                    metrics::counter!("zatat_supervisor_panics_total", "task" => name).increment(1);
+                }
+                Err(_) => {
+                    warn!(
+                        task = name,
+                        "supervised task was cancelled; exiting supervisor"
+                    );
+                    return;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+            backoff_ms = (backoff_ms * 2).min(30_000);
+        }
+    });
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "zatat", version, about = "Pusher-compatible realtime server")]
 struct Cli {
@@ -106,40 +146,80 @@ async fn start(config_path: &Path, debug: bool) -> Result<()> {
         let dispatcher = state.dispatcher.clone();
         let config_for_bus = config.clone();
         let provider_clone = provider.clone();
-        tokio::spawn(async move {
-            use tokio::sync::broadcast::error::RecvError;
-            match provider_clone.subscribe().await {
-                Ok(mut rx) => loop {
-                    match rx.recv().await {
-                        Ok(bytes) => {
-                            if let Ok(env) = zatat_scaling::message::parse(&bytes) {
-                                dispatcher.handle_incoming(env, |id| config_for_bus.app_by_id(id));
+        supervise("scaling_subscriber", move || {
+            let dispatcher = dispatcher.clone();
+            let config_for_bus = config_for_bus.clone();
+            let provider_clone = provider_clone.clone();
+            async move {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                use std::time::{Duration, Instant};
+                use tokio::sync::broadcast::error::RecvError;
+                let lagged_drops_total = AtomicU64::new(0);
+                let mut last_warn: Option<Instant> = None;
+                const LAG_WARN_INTERVAL: Duration = Duration::from_secs(10);
+                match provider_clone.subscribe().await {
+                    Ok(mut rx) => loop {
+                        match rx.recv().await {
+                            Ok(bytes) => {
+                                if let Ok(env) = zatat_scaling::message::parse(&bytes) {
+                                    dispatcher
+                                        .handle_incoming(env, |id| config_for_bus.app_by_id(id));
+                                }
+                            }
+                            Err(RecvError::Lagged(n)) => {
+                                metrics::counter!("zatat_scaling_lagged_drops_total").increment(n);
+                                let total = lagged_drops_total.fetch_add(n, Ordering::Relaxed) + n;
+                                let now = Instant::now();
+                                let should_warn = match last_warn {
+                                    None => true,
+                                    Some(t) => now.duration_since(t) >= LAG_WARN_INTERVAL,
+                                };
+                                if should_warn {
+                                    last_warn = Some(now);
+                                    warn!(
+                                        skipped_this_event = n,
+                                        total_drops_since_start = total,
+                                        "scaling subscriber lagged; cross-node events dropped \
+                                         — increase Redis pub/sub capacity or scale the consumer"
+                                    );
+                                }
+                                continue;
+                            }
+                            Err(RecvError::Closed) => {
+                                warn!("scaling subscriber stream ended");
+                                break;
                             }
                         }
-                        Err(RecvError::Lagged(n)) => {
-                            warn!(skipped = n, "scaling subscriber lagged; messages missed");
-                            continue;
-                        }
-                        Err(RecvError::Closed) => {
-                            warn!("scaling subscriber stream ended");
-                            break;
-                        }
-                    }
-                },
-                Err(err) => warn!(%err, "failed to subscribe to Redis bus"),
+                    },
+                    Err(err) => warn!(%err, "failed to subscribe to Redis bus"),
+                }
             }
         });
-        tokio::spawn(zatat_ws::tasks::presence_snapshot_publisher(state.clone()));
-        tokio::spawn(zatat_ws::tasks::presence_cache_gc(state.clone()));
+        let snap_state = state.clone();
+        supervise("presence_snapshot_publisher", move || {
+            zatat_ws::tasks::presence_snapshot_publisher(snap_state.clone())
+        });
+        let gc_state = state.clone();
+        supervise("presence_cache_gc", move || {
+            zatat_ws::tasks::presence_cache_gc(gc_state.clone())
+        });
     }
-    tokio::spawn(zatat_ws::tasks::restart_signal_watcher(state.clone()));
-    tokio::spawn(zatat_ws::tasks::connection_maintenance(
-        state.clone(),
-        state.tracker.clone(),
-    ));
+    let restart_state = state.clone();
+    supervise("restart_signal_watcher", move || {
+        zatat_ws::tasks::restart_signal_watcher(restart_state.clone())
+    });
+    let maint_state = state.clone();
+    let tracker = state.tracker.clone();
+    supervise("connection_maintenance", move || {
+        zatat_ws::tasks::connection_maintenance(maint_state.clone(), tracker.clone())
+    });
     // Watch zatat.toml; swap the [[apps]] table on mtime change.
     // Live WS connections keep their captured AppArc and are unaffected.
-    tokio::spawn(watch_config_apps(config.clone(), config_path.to_path_buf()));
+    let config_watch = config.clone();
+    let config_watch_path = config_path.to_path_buf();
+    supervise("watch_config_apps", move || {
+        watch_config_apps(config_watch.clone(), config_watch_path.clone())
+    });
 
     // When `server.path` is set, WS + REST routes live under that prefix;
     // `/health` stays at the root so LB probes don't need the prefix.
@@ -361,5 +441,63 @@ async fn ping(config_path: &Path) -> Result<()> {
             Ok(())
         }
         Err(err) => anyhow::bail!("{url} unreachable: {err}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// Regression: before `supervise`, a panicking background task died
+    /// silently and was never restarted. This test proves that a task that
+    /// panics on its first call is invoked again on respawn. Uses real
+    /// time (tokio test-util feature isn't enabled in this workspace), so
+    /// it has to wait through the 500ms backoff.
+    #[tokio::test]
+    async fn supervise_respawns_on_panic() {
+        let counter = Arc::new(AtomicU32::new(0));
+        let c = counter.clone();
+        super::supervise("panic-test", move || {
+            let c = c.clone();
+            async move {
+                let n = c.fetch_add(1, Ordering::Relaxed);
+                if n == 0 {
+                    panic!("intentional panic in supervised task (test)");
+                }
+                // Second call: sleep forever so we don't respawn again.
+                std::future::pending::<()>().await;
+            }
+        });
+        // Supervisor sleeps 500ms before respawn; wait a bit longer.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let seen = counter.load(Ordering::Relaxed);
+        assert!(
+            seen >= 2,
+            "supervisor should respawn after a panic; only {seen} invocations observed"
+        );
+    }
+
+    /// A task that exits cleanly also gets respawned — the critical
+    /// background loops never "finish" in normal operation, so an orderly
+    /// exit is itself a signal something went wrong.
+    #[tokio::test]
+    async fn supervise_respawns_on_clean_exit() {
+        let counter = Arc::new(AtomicU32::new(0));
+        let c = counter.clone();
+        super::supervise("clean-exit-test", move || {
+            let c = c.clone();
+            async move {
+                let n = c.fetch_add(1, Ordering::Relaxed);
+                if n == 0 {
+                    // First call: return immediately (clean exit).
+                    return;
+                }
+                std::future::pending::<()>().await;
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert!(counter.load(Ordering::Relaxed) >= 2);
     }
 }

@@ -1,7 +1,9 @@
+use std::collections::HashMap;
 use std::time::Instant;
 
 use dashmap::DashMap;
 use parking_lot::RwLock;
+use serde_json::Value;
 
 use crate::message::{PresenceSnapshotMember, SNAPSHOT_TTL};
 
@@ -12,15 +14,34 @@ pub struct ExpiredMember {
     pub user_id: String,
 }
 
+/// Per-peer presence roster for one (app, channel). Live `member_added` and
+/// `member_removed` bus events mutate `members` in-place; a full snapshot
+/// replaces `members` wholesale.
 struct PeerSnapshot {
     inserted_at: Instant,
-    members: Vec<PresenceSnapshotMember>,
+    members: HashMap<String, Option<Value>>,
+}
+
+impl PeerSnapshot {
+    fn new(members: impl IntoIterator<Item = PresenceSnapshotMember>) -> Self {
+        Self {
+            inserted_at: Instant::now(),
+            members: members
+                .into_iter()
+                .map(|m| (m.user_id, m.user_info))
+                .collect(),
+        }
+    }
+
+    fn touch(&mut self) {
+        self.inserted_at = Instant::now();
+    }
 }
 
 type AppChannelKey = (String, String);
 
 pub struct PresenceCache {
-    peers: DashMap<AppChannelKey, RwLock<std::collections::HashMap<String, PeerSnapshot>>>,
+    peers: DashMap<AppChannelKey, RwLock<HashMap<String, PeerSnapshot>>>,
 }
 
 impl Default for PresenceCache {
@@ -36,6 +57,7 @@ impl PresenceCache {
         Self::default()
     }
 
+    /// Replace the peer's roster wholesale. Used for periodic snapshots.
     pub fn insert_snapshot(
         &self,
         app_id: &str,
@@ -46,13 +68,71 @@ impl PresenceCache {
         let key = (app_id.to_string(), channel.to_string());
         let entry = self.peers.entry(key).or_default();
         let mut inner = entry.write();
-        inner.insert(
-            node_id.to_string(),
-            PeerSnapshot {
-                inserted_at: Instant::now(),
-                members,
-            },
-        );
+        inner.insert(node_id.to_string(), PeerSnapshot::new(members));
+    }
+
+    /// Add one user to the peer's live roster (live MemberAdded event).
+    /// Returns true if the user was newly added to this peer's set.
+    pub fn add_live(
+        &self,
+        app_id: &str,
+        channel: &str,
+        node_id: &str,
+        user_id: String,
+        user_info: Option<Value>,
+    ) -> bool {
+        let key = (app_id.to_string(), channel.to_string());
+        let entry = self.peers.entry(key).or_default();
+        let mut inner = entry.write();
+        let peer = inner
+            .entry(node_id.to_string())
+            .or_insert_with(|| PeerSnapshot::new(Vec::new()));
+        peer.touch();
+        peer.members.insert(user_id, user_info).is_none()
+    }
+
+    /// Remove one user from the peer's live roster. Returns true if the
+    /// user was actually present on this peer.
+    pub fn remove_live(&self, app_id: &str, channel: &str, node_id: &str, user_id: &str) -> bool {
+        let key = (app_id.to_string(), channel.to_string());
+        let Some(entry) = self.peers.get(&key) else {
+            return false;
+        };
+        let mut inner = entry.write();
+        let Some(peer) = inner.get_mut(node_id) else {
+            return false;
+        };
+        peer.touch();
+        peer.members.remove(user_id).is_some()
+    }
+
+    /// Whether any peer (other than `except_node`) reports this user in
+    /// the channel. Stale peers (past TTL) are ignored.
+    pub fn is_present_excluding(
+        &self,
+        app_id: &str,
+        channel: &str,
+        user_id: &str,
+        except_node: Option<&str>,
+    ) -> bool {
+        let key = (app_id.to_string(), channel.to_string());
+        let Some(entry) = self.peers.get(&key) else {
+            return false;
+        };
+        let inner = entry.read();
+        let now = Instant::now();
+        for (node, peer) in inner.iter() {
+            if matches!(except_node, Some(n) if n == node) {
+                continue;
+            }
+            if now.duration_since(peer.inserted_at) > SNAPSHOT_TTL {
+                continue;
+            }
+            if peer.members.contains_key(user_id) {
+                return true;
+            }
+        }
+        false
     }
 
     pub fn remote_members_for(&self, app_id: &str, channel: &str) -> Vec<PresenceSnapshotMember> {
@@ -68,9 +148,12 @@ impl PresenceCache {
             if now.duration_since(peer.inserted_at) > SNAPSHOT_TTL {
                 continue;
             }
-            for m in &peer.members {
-                if seen.insert(m.user_id.clone()) {
-                    out.push(m.clone());
+            for (user_id, user_info) in &peer.members {
+                if seen.insert(user_id.clone()) {
+                    out.push(PresenceSnapshotMember {
+                        user_id: user_id.clone(),
+                        user_info: user_info.clone(),
+                    });
                 }
             }
         }
@@ -95,11 +178,11 @@ impl PresenceCache {
                 .collect();
             for node in drop_peers {
                 if let Some(snap) = inner.remove(&node) {
-                    for m in snap.members {
+                    for user_id in snap.members.into_keys() {
                         expired.push(ExpiredMember {
                             app_id: key.0.clone(),
                             channel: key.1.clone(),
-                            user_id: m.user_id,
+                            user_id,
                         });
                     }
                 }
@@ -164,5 +247,41 @@ mod tests {
         let expired = c.gc_expired();
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].user_id, "u1");
+    }
+
+    #[test]
+    fn live_add_and_remove_tracked() {
+        let c = PresenceCache::new();
+        let added = c.add_live("a", "presence-x", "n1", "u1".into(), None);
+        assert!(added);
+        assert!(c.is_present_excluding("a", "presence-x", "u1", None));
+        assert!(!c.is_present_excluding("a", "presence-x", "u1", Some("n1")));
+        let removed = c.remove_live("a", "presence-x", "n1", "u1");
+        assert!(removed);
+        assert!(!c.is_present_excluding("a", "presence-x", "u1", None));
+    }
+
+    #[test]
+    fn live_add_is_idempotent() {
+        let c = PresenceCache::new();
+        assert!(c.add_live("a", "presence-x", "n1", "u1".into(), None));
+        assert!(!c.add_live("a", "presence-x", "n1", "u1".into(), None));
+    }
+
+    #[test]
+    fn remove_live_returns_false_when_absent() {
+        let c = PresenceCache::new();
+        assert!(!c.remove_live("a", "presence-x", "n1", "u1"));
+    }
+
+    #[test]
+    fn snapshot_replaces_live_entries() {
+        let c = PresenceCache::new();
+        c.add_live("a", "presence-x", "n1", "u1".into(), None);
+        c.add_live("a", "presence-x", "n1", "u2".into(), None);
+        c.insert_snapshot("a", "presence-x", "n1", vec![mk_member("u3")]);
+        let members = c.remote_members_for("a", "presence-x");
+        let ids: Vec<_> = members.iter().map(|m| m.user_id.as_str()).collect();
+        assert_eq!(ids, vec!["u3"]);
     }
 }

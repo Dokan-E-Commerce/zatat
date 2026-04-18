@@ -6,8 +6,8 @@ use zatat_channels::ChannelManager;
 use zatat_config::Config;
 use zatat_core::application::Application;
 use zatat_core::id::AppId;
-use zatat_scaling::{EventDispatcher, LocalOnlyProvider, PubSubProvider};
-use zatat_webhooks::{CompiledTarget, WebhookConfig, WebhookDispatcher};
+use zatat_scaling::{EventDispatcher, LocalOnlyProvider, PubSubProvider, PublishOverflow};
+use zatat_webhooks::{CompiledTarget, WebhookConfig, WebhookDispatcher, WebhookOverflow};
 
 pub type ServerState = Arc<ServerStateInner>;
 
@@ -40,20 +40,37 @@ impl ServerStateInner {
         scaling_enabled: bool,
     ) -> Arc<Self> {
         let channels = ChannelManager::new();
-        let dispatcher = Arc::new(EventDispatcher::new(
+        let overflow = config
+            .server
+            .scaling
+            .as_ref()
+            .map(|s| match s.overflow_mode {
+                zatat_config::OverflowMode::BestEffort => PublishOverflow::BestEffort,
+                zatat_config::OverflowMode::Block => PublishOverflow::Block,
+            })
+            .unwrap_or_default();
+        let dispatcher = Arc::new(EventDispatcher::with_overflow(
             channels.clone(),
             provider,
             scaling_enabled,
+            overflow,
         ));
         // Webhook lookup reads the LIVE apps table, so adding/removing
         // webhook targets via a config reload takes effect immediately.
         let config_for_webhooks = config.clone();
-        let webhooks = Arc::new(WebhookDispatcher::spawn(move |app_id| {
-            let Some(app) = config_for_webhooks.app_by_id(&AppId::from(app_id)) else {
-                return Vec::new();
-            };
-            compile_webhook_targets_for_app(&app)
-        }));
+        let webhook_overflow = match config.server.webhook_overflow_mode {
+            zatat_config::OverflowMode::BestEffort => WebhookOverflow::BestEffort,
+            zatat_config::OverflowMode::Block => WebhookOverflow::Block,
+        };
+        let webhooks = Arc::new(WebhookDispatcher::spawn_with_overflow(
+            move |app_id| {
+                let Some(app) = config_for_webhooks.app_by_id(&AppId::from(app_id)) else {
+                    return Vec::new();
+                };
+                compile_webhook_targets_for_app(&app)
+            },
+            webhook_overflow,
+        ));
         let (shutdown, _) = broadcast::channel(1);
         Arc::new(Self {
             config,

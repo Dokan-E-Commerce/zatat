@@ -208,12 +208,29 @@ impl ChannelManager {
     }
 
     /// Idempotent — safe to call repeatedly for the same (user, socket).
-    pub fn bind_user(&self, app_id: &AppId, user_id: &str, socket_id: &SocketId) {
+    /// Returns `true` if this was the first local socket for `user_id`.
+    pub fn bind_user(&self, app_id: &AppId, user_id: &str, socket_id: &SocketId) -> bool {
         let slot = self.app_slot(app_id);
         let mut entry = slot.user_index.entry(user_id.to_string()).or_default();
+        let was_empty = entry.is_empty();
         if !entry.iter().any(|s| s == socket_id.as_str()) {
             entry.push(socket_id.as_str().to_string());
         }
+        was_empty
+    }
+
+    /// List every user_id with at least one local socket, for session snapshots.
+    pub fn local_user_ids(&self, app_id: &AppId) -> Vec<String> {
+        self.apps()
+            .get(app_id.as_str())
+            .map(|slot| {
+                slot.user_index
+                    .iter()
+                    .filter(|e| !e.value().is_empty())
+                    .map(|e| e.key().clone())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Returns `true` if the removed socket was that user's last one.

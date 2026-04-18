@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use subtle::ConstantTimeEq;
-use tracing::{info, warn};
+use tracing::info;
 
 pub const COUNTER_CONNECTIONS_TOTAL: &str = "zatat_connections_total";
 pub const COUNTER_CONNECTIONS_CLOSED: &str = "zatat_connections_closed_total";
@@ -23,6 +23,16 @@ pub struct MetricsInstaller {
 
 impl MetricsInstaller {
     pub fn install(listen: SocketAddr, bearer_token: Option<String>) -> Result<Self, String> {
+        // Fail closed: binding metrics to a non-loopback address without a
+        // bearer token exposes internal observability data (and potentially
+        // PII in labels) to the network. We refuse to start rather than warn.
+        if !listen.ip().is_loopback() && bearer_token.is_none() {
+            return Err(format!(
+                "[server.prometheus] listen={listen} is non-loopback but no bearer_token is set — \
+                 set server.prometheus.bearer_token or bind to 127.0.0.1"
+            ));
+        }
+
         let builder = PrometheusBuilder::new();
         let handle = builder
             .install_recorder()
@@ -56,11 +66,6 @@ impl MetricsInstaller {
         metrics::counter!(COUNTER_RATE_LIMITED).absolute(0);
         metrics::counter!(COUNTER_REDIS_RECONNECTS).absolute(0);
 
-        if !listen.ip().is_loopback() && bearer_token.is_none() {
-            warn!(
-                "Prometheus /metrics is bound to a non-loopback interface WITHOUT a bearer_token — set server.prometheus.bearer_token before exposing this port. listen={listen}"
-            );
-        }
         info!(%listen, "metrics endpoint configured");
         Ok(Self {
             handle,
@@ -74,8 +79,9 @@ impl MetricsInstaller {
     }
 
     /// Constant-time check of `Authorization: Bearer <token>`. When no
-    /// token is configured, allows the request unconditionally (install()
-    /// warns at startup if that happens on a non-loopback bind).
+    /// token is configured, allows the request unconditionally — but
+    /// `install()` fails closed at startup when that happens on a
+    /// non-loopback bind, so this branch is only reached on loopback.
     pub fn authorize(&self, auth_header: Option<&str>) -> bool {
         match &self.bearer_token {
             Some(expected) => {
@@ -93,5 +99,39 @@ impl MetricsInstaller {
 
     pub fn render(&self) -> String {
         self.handle.render()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn refuses_non_loopback_without_bearer_token() {
+        let listen = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 9090);
+        match MetricsInstaller::install(listen, None) {
+            Ok(_) => panic!("must fail closed on non-loopback without bearer token"),
+            Err(err) => assert!(
+                err.contains("bearer_token") || err.contains("127.0.0.1"),
+                "error should mention token or loopback: {err}"
+            ),
+        }
+    }
+
+    #[test]
+    fn loopback_without_bearer_token_is_allowed() {
+        // Install twice would re-register global recorder; we only need to
+        // prove the guard doesn't fire on loopback. Any other install error
+        // (e.g. recorder already installed in a later test run) still
+        // indicates we cleared the guard.
+        let listen = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9091);
+        let result = MetricsInstaller::install(listen, None);
+        if let Err(err) = result {
+            assert!(
+                !err.contains("non-loopback"),
+                "loopback install wrongly blocked by non-loopback guard: {err}"
+            );
+        }
     }
 }
