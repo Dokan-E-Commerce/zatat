@@ -276,11 +276,24 @@ async fn start(config_path: &Path, debug: bool) -> Result<()> {
         .context("parsing server.host:port")?;
     info!(%listen_addr, "zatat listening");
 
-    let shutdown = state.clone();
-    let ctrl_c = async move {
-        shutdown_signal().await;
-        shutdown.shutdown_now();
-    };
+    // Graceful shutdown contract (critical for zero-downtime deploys):
+    //   1. SIGTERM / SIGINT received.
+    //   2. state.shutdown_now() — broadcast pusher_close(1001) to every
+    //      live WS connection so clients see a clean close and reconnect.
+    //   3. Short pause (2s) so those close frames physically leave the
+    //      TCP buffer before we stop accepting writes.
+    //   4. Ask the HTTP listener to drain — it stops accepting new
+    //      connections but WAITS for in-flight request handlers (e.g.
+    //      Laravel POST /events) to return their responses. Up to 30s.
+    //   5. Serve future returns cleanly.
+    //
+    // The previous `tokio::select!` pattern bypassed step 4 — when ctrl_c
+    // fired, the serve future was dropped mid-flight and any in-flight
+    // HTTP request got aborted, which showed up as `cURL error 28 / 0 bytes
+    // received` on the publisher side (~1k failed Laravel publishes during
+    // a single bad rolling deploy on prod, 2026-04-18).
+    const GRACEFUL_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    const WS_CLOSE_FLUSH_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 
     if let Some(tls) = &config.server.tls {
         // rustls 0.23 needs an explicit crypto provider. idempotent if already set.
@@ -294,23 +307,47 @@ async fn start(config_path: &Path, debug: bool) -> Result<()> {
             tls.cert.clone(),
             tls.key.clone(),
         ));
-        let listener = axum_server::bind_rustls(listen_addr, rustls_config);
-        tokio::select! {
-            _ = ctrl_c => {}
-            res = listener.serve(app_router.into_make_service_with_connect_info::<SocketAddr>()) => {
-                res.context("tls server")?;
-            }
-        }
+        let handle = axum_server::Handle::new();
+        let shutdown_state = state.clone();
+        let handle_for_shutdown = handle.clone();
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            info!("[shutdown] signal received — closing WS connections with 1001");
+            shutdown_state.shutdown_now();
+            tokio::time::sleep(WS_CLOSE_FLUSH_DELAY).await;
+            info!(
+                timeout_s = GRACEFUL_HTTP_TIMEOUT.as_secs(),
+                "[shutdown] asking HTTP listener to drain in-flight requests"
+            );
+            handle_for_shutdown.graceful_shutdown(Some(GRACEFUL_HTTP_TIMEOUT));
+        });
+        axum_server::bind_rustls(listen_addr, rustls_config)
+            .handle(handle)
+            .serve(app_router.into_make_service_with_connect_info::<SocketAddr>())
+            .await
+            .context("tls server")?;
     } else {
         let listener = tokio::net::TcpListener::bind(listen_addr)
             .await
             .context("bind")?;
-        tokio::select! {
-            _ = ctrl_c => {}
-            res = axum::serve(listener, app_router.into_make_service_with_connect_info::<SocketAddr>()) => {
-                res.context("serve")?;
-            }
-        }
+        let shutdown_state = state.clone();
+        axum::serve(
+            listener,
+            app_router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            info!("[shutdown] signal received — closing WS connections with 1001");
+            shutdown_state.shutdown_now();
+            tokio::time::sleep(WS_CLOSE_FLUSH_DELAY).await;
+            info!("[shutdown] HTTP listener draining in-flight requests");
+            // axum::serve's graceful_shutdown future completes here → axum
+            // stops accepting new connections, then waits for in-flight to
+            // finish. No explicit timeout API on axum::serve, so we rely on
+            // request handlers being bounded (our routes are all short).
+        })
+        .await
+        .context("serve")?;
     }
 
     info!("shutdown complete");
