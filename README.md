@@ -9,6 +9,14 @@ Laravel Echo, `pusher-http-node`, `pusher-http-php`, `pusher-http-python`,
 plain HTTP client — connects to zatat without code changes. Point it at
 `ws://host:8080/app/YOUR_KEY` and it just works.
 
+A client *library* version (e.g. `pusher-js` 8.5.0) is not the same as the
+Channels *protocol* version it speaks. zatat accepts protocol **5, 6, and
+7** at the WebSocket handshake and does not inspect the library version
+string the client sends, so **pusher-js 8.x — 8.5.0 included — and the
+matching Laravel Echo and mobile SDK releases are fully supported**: they
+all negotiate protocol 7. A client that requests any other protocol
+version is closed with `pusher:error 4007`.
+
 The name means "in a hurry" (زتات) in Bahraini Arabic. Seemed fitting.
 
 [pusher-protocol]: https://pusher.com/docs/channels/library_auth_reference/pusher-websockets-protocol/
@@ -353,7 +361,7 @@ All endpoints use HMAC-SHA256 request signing, verified in constant time.
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/apps/:id/events` | Publish one event (supports `info` echo) |
-| `POST` | `/apps/:id/batch_events` | Publish up to 10 at once (per-event `info` echo) |
+| `POST` | `/apps/:id/batch_events` | Publish multiple events in one request, no per-batch cap (per-event `info` echo) |
 | `GET` | `/apps/:id/channels` | List active channels (fleet-wide when scaling) |
 | `GET` | `/apps/:id/channels/:channel` | Inspect one channel (`info=occupied,subscription_count,user_count,cache`; fleet-wide when scaling) |
 | `GET` | `/apps/:id/channels/:channel/users` | Members of a presence channel (fleet-wide when scaling) |
@@ -437,9 +445,13 @@ Double-encryption is prevented — zatat checks `looks_encrypted(data)`
 before wrapping, so if the backend already sent a `{nonce, ciphertext}`
 object it's passed through untouched.
 
-Fails closed: if the app has no valid `encryption_master_key` configured,
-or encryption of the payload fails for any reason, the event is dropped
-— a `WARN` is logged, but it is never sent to subscribers as plaintext.
+Fails closed, but only where server-side encryption is actually in play: a
+payload that already looks encrypted (`{nonce, ciphertext}`, i.e.
+passthrough mode) is forwarded regardless of whether a master key is
+configured. A plaintext payload that needs server-side encryption is a
+different story — if the app has no valid `encryption_master_key`
+configured, or encryption fails for any reason, that event is dropped and
+a `WARN` is logged. It is never sent to subscribers as plaintext.
 
 ---
 
@@ -467,7 +479,8 @@ work:
   from peers and `member_removed` fires within ~5–15 s.
 - **Cross-node `GET /channels`** — originator publishes a `MetricsRequest`
   on the bus, peers respond with their local channel lists, originator
-  merges. 750 ms collection window, originator's own echo filtered out.
+  merges. Up to a 750 ms window, returning as soon as all known peers
+  respond; originator's own echo filtered out.
 - **Cross-node `GET /channels/:channel` and `GET .../users`** — these
   don't do a live roundtrip. They read the same continuously-updated
   peer caches used for presence (subscription counts and presence
@@ -792,6 +805,11 @@ live in `bench/README.md`.
 - Cross-referenced against the official [Pusher protocol spec][pusher-protocol]
   and live-diffed against Laravel Reverb. Every frame type matches
   byte-for-byte when the two servers run with matching config.
+- Channels protocol versions **5, 6, and 7** are accepted at the WS
+  handshake; anything else is closed with 4007. The client *library*
+  version (the `version=` query param) is not inspected, so `pusher-js`
+  8.x — 8.5.0 included — connects on protocol 7 like every other current
+  SDK.
 - Error codes emitted: **4001** (app doesn't exist), **4004** (over
   quota), **4009** (unauthorized / bad origin), **4200** (invalid
   message format), **4201** (stale prune), **4301** (rate limit /
@@ -823,13 +841,14 @@ most of the way there. Before shipping, run the hardening churn scripts
 in a loop for 24 h on a real Linux box watching RSS, actually build and
 run the Docker image in staging, canary behind a small LB weight first.
 
-**SLA-bound / payment-critical**: not yet. The remaining gaps are
-**external security audit**, **fuzz testing** of protocol parsers
-(`cargo-fuzz` on `parse_inbound`, `verify_http`, `decrypt_payload`), a
-**multi-week soak in a staging environment under replayed production
-traffic**, **verified 250 k-connection test on tuned Linux** (the design
-target, currently unrun), and a **CI pipeline** that runs the whole test
-matrix on every push.
+**SLA-bound / payment-critical**: not yet. CI (`.github/workflows/ci.yml`)
+runs fmt+clippy, `cargo test --workspace`, a Docker build/smoke-test, and
+a `fuzz-smoke` job on every push and PR, fuzzing `parse_inbound`,
+`verify_http`, `decrypt_payload`, and `presence_from_members`
+(`fuzz/fuzz_targets/`) for 30 s each. What's still missing: an **external
+security audit**, a **multi-week soak in a staging environment under
+replayed production traffic**, and a **verified 250 k-connection test on
+tuned Linux** (the design target, currently unrun).
 
 ---
 
@@ -837,20 +856,20 @@ matrix on every push.
 
 ```sh
 cargo build --workspace
-cargo test --workspace                                      # unit + proptest, ~55 tests
+cargo test --workspace                                      # unit + proptest, ~110 tests
 cargo clippy --workspace --all-targets -- -D warnings       # lint
 cargo run --bin zatat -- start --config zatat.toml.example --debug
 ```
 
-The hardening E2E suite (23 scenarios, ~100 individual checks) lives
-under `tests/hardening/`:
+The hardening E2E suite (46 scenarios, hundreds of individual checks)
+lives under `tests/hardening/`:
 
 ```sh
 redis-server --port 16379 --save "" --daemonize yes --dir /tmp/chaos-redis
 cd tests/hardening
 ulimit -n 10000
-node run-all.mjs                  # runs every scenario
-SKIP_LONG=0 node run-all.mjs      # also runs the ~130 s idle-prune cycle
+node run-all.mjs                  # runs every scenario except 10-soak
+SOAK=1 node run-all.mjs           # also runs 10-soak, the long soak scenario
 ```
 
 The repository is a Cargo workspace, one crate per concern:
