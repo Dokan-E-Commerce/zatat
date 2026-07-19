@@ -13,11 +13,12 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  # ghcr.io requires a lowercase path; github.repository preserves the
-  # repo's case, which breaks the raw digest push in the build job below
-  # (docker/metadata-action lowercases for you, but we push by digest here
-  # before metadata-action ever sees the name).
-  IMAGE_NAME: ${{ toLower(github.repository) }}
+  # ghcr.io requires a lowercase path. github.repository is mixed-case
+  # (Dokan-E-Commerce/zatat) and GitHub Actions expressions have no
+  # lowercase function, so the path is hardcoded lowercase here — it is
+  # used to push by digest before docker/metadata-action (which would
+  # lowercase for us) ever sees the name.
+  IMAGE_NAME: dokan-e-commerce/zatat
 
 jobs:
   # arm64 QEMU emulation was too slow for a release build (8da4c6c). GitHub's
