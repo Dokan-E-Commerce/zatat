@@ -213,7 +213,7 @@ proptest! {
             }
 
             // Invariant 2: presence user_count matches distinct user_ids.
-            for ((ch_name, _user), _) in user_refs.iter() {
+            for (ch_name, _user) in user_refs.keys() {
                 let distinct_users = user_refs
                     .iter()
                     .filter(|((c, _), _)| c == ch_name)
