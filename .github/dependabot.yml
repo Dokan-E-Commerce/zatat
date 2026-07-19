@@ -10,6 +10,13 @@ updates:
         update-types:
           - minor
           - patch
+    # Major bumps of compiled dependencies (fred, axum-server, metrics,
+    # rand, ...) carry breaking API changes and must be migrated by hand,
+    # not opened as failing automated PRs. Bump them deliberately.
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - version-update:semver-major
 
   - package-ecosystem: github-actions
     directory: "/"
