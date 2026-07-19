@@ -56,7 +56,7 @@ rustls-pemfile = "2"
 axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
 fred = { version = "9", default-features = false, features = ["subscriber-client", "network-logs"] }
 metrics = "0.24"
-metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
+metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 futures = "0.3"
