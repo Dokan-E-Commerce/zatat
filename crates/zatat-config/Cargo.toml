@@ -13,3 +13,4 @@ figment.workspace = true
 toml.workspace = true
 thiserror.workspace = true
 arc-swap.workspace = true
+tracing = { workspace = true }

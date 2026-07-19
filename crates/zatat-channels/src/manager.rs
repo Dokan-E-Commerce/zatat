@@ -79,13 +79,14 @@ impl ChannelManager {
         handle: ConnectionHandle,
     ) -> Result<(), ChannelManagerError> {
         let slot = self.app_slot(&app.id);
+        let socket_key = handle.socket_id().as_str().to_string();
+        slot.connections.insert(socket_key.clone(), handle);
         if let Some(max) = app.max_connections {
-            if slot.connections.len() as u32 >= max {
+            if slot.connections.len() as u32 > max {
+                slot.connections.remove(&socket_key);
                 return Err(ChannelManagerError::ConnectionLimitReached);
             }
         }
-        slot.connections
-            .insert(handle.socket_id().as_str().to_string(), handle);
         Ok(())
     }
 
@@ -158,9 +159,7 @@ impl ChannelManager {
         let slot = self.apps().get(app_id.as_str())?;
         let channel = slot.channels.get(channel_name)?.clone();
         let outcome = channel.unsubscribe(socket_id);
-        if channel.is_empty() {
-            slot.channels.remove(channel_name);
-        }
+        slot.channels.remove_if(channel_name, |_, ch| ch.is_empty());
         Some(outcome)
     }
 
@@ -190,6 +189,35 @@ impl ChannelManager {
             .or_insert_with(|| Arc::new(Channel::with_cache_ttl(name, ttl)))
             .clone();
         Some(ch)
+    }
+
+    /// Removes cache channels that have no subscribers and no live cached
+    /// payload. Publishing to a `cache-*` channel with zero subscribers
+    /// creates the channel via `get_or_create_cache_channel`, and nothing
+    /// else ever removes it, so this must run periodically to bound growth.
+    /// Returns the number of channels removed.
+    pub fn gc_empty_cache_channels(&self) -> usize {
+        let mut removed = 0;
+        for app_slot in self.apps().iter() {
+            let cache_channel_names: Vec<String> = app_slot
+                .channels
+                .iter()
+                .filter(|e| e.value().kind().is_cache())
+                .map(|e| e.key().clone())
+                .collect();
+            for name in cache_channel_names {
+                if app_slot
+                    .channels
+                    .remove_if(&name, |_, ch| {
+                        ch.is_empty() && ch.cached_payload().is_none()
+                    })
+                    .is_some()
+                {
+                    removed += 1;
+                }
+            }
+        }
+        removed
     }
 
     pub fn channels(&self, app_id: &AppId) -> Vec<Arc<Channel>> {
@@ -306,6 +334,145 @@ impl ChannelManager {
             if empty {
                 slot.watchers.remove(&watched);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zatat_core::application::{AcceptClientEventsFrom, Application};
+    use zatat_core::id::AppKey;
+
+    fn mk_app(cache_ttl_seconds: Option<u64>) -> AppArc {
+        Arc::new(
+            Application::new(
+                AppId::from("app"),
+                AppKey::from("key"),
+                "secret".into(),
+                30,
+                30,
+                10_000,
+                None,
+                AcceptClientEventsFrom::Members,
+                None,
+                vec!["*".into()],
+            )
+            .unwrap()
+            .with_cache_ttl_seconds(cache_ttl_seconds),
+        )
+    }
+
+    #[test]
+    fn gc_empty_cache_channels_removes_expired_unoccupied() {
+        let mgr = ChannelManager::new();
+        let app = mk_app(Some(0));
+
+        let ch = mgr
+            .get_or_create_cache_channel(&app, "cache-gc-test")
+            .expect("cache channel created");
+        ch.set_cached_payload(Arc::from("{\"hello\":1}".to_string().into_boxed_str()));
+        assert!(mgr.find_channel(&app.id, "cache-gc-test").is_some());
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let removed = mgr.gc_empty_cache_channels();
+        assert_eq!(removed, 1);
+        assert!(mgr.find_channel(&app.id, "cache-gc-test").is_none());
+    }
+
+    #[test]
+    fn gc_empty_cache_channels_keeps_occupied_and_live_payload() {
+        let mgr = ChannelManager::new();
+        let app = mk_app(None); // no TTL -> payload never expires
+
+        // Occupied cache channel: has a subscriber, no payload set.
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let handle = ConnectionHandle::from_parts(
+            SocketId::from_string("sock-1".into()),
+            tx,
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        mgr.subscribe(
+            &app,
+            &ChannelName::new("cache-occupied".to_string()),
+            SocketId::from_string("sock-1".into()),
+            handle,
+            None,
+        );
+
+        // Empty channel with a live (non-expired) payload.
+        let ch = mgr
+            .get_or_create_cache_channel(&app, "cache-live-payload")
+            .expect("cache channel created");
+        ch.set_cached_payload(Arc::from("{\"hello\":1}".to_string().into_boxed_str()));
+
+        let removed = mgr.gc_empty_cache_channels();
+        assert_eq!(removed, 0);
+        assert!(mgr.find_channel(&app.id, "cache-occupied").is_some());
+        assert!(mgr.find_channel(&app.id, "cache-live-payload").is_some());
+    }
+
+    /// Regression: `register_connection` used to check-then-insert
+    /// (`len() >= max` before inserting), which let concurrent registrations
+    /// race past the check together and land above `max_connections`. The
+    /// fix inserts optimistically and rolls back if the post-insert count
+    /// overshoots. Runs many iterations with real OS threads racing to
+    /// register so the invariant is exercised, not just asserted once.
+    #[test]
+    fn concurrent_register_never_exceeds_max_connections() {
+        const MAX: u32 = 8;
+        const THREADS: usize = 16;
+
+        for iteration in 0..50 {
+            let mgr = ChannelManager::new();
+            let app = Arc::new(
+                Application::new(
+                    AppId::from("app"),
+                    AppKey::from("key"),
+                    "secret".into(),
+                    30,
+                    30,
+                    10_000,
+                    Some(MAX),
+                    AcceptClientEventsFrom::Members,
+                    None,
+                    vec!["*".into()],
+                )
+                .unwrap(),
+            );
+
+            let handles: Vec<_> = (0..THREADS)
+                .map(|i| {
+                    let mgr = mgr.clone();
+                    let app = app.clone();
+                    std::thread::spawn(move || {
+                        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+                        let handle = ConnectionHandle::from_parts(
+                            SocketId::from_string(format!("1.{i}")),
+                            tx,
+                            Arc::new(tokio::sync::Notify::new()),
+                        );
+                        mgr.register_connection(app, handle)
+                    })
+                })
+                .collect();
+
+            let results: Vec<_> = handles
+                .into_iter()
+                .map(|h| h.join().expect("registration thread must not panic"))
+                .collect();
+            let ok_count = results.iter().filter(|r| r.is_ok()).count();
+            let count = mgr.connection_count(&app.id);
+
+            assert!(
+                count <= MAX as usize,
+                "iteration {iteration}: connection_count {count} exceeded max_connections {MAX}"
+            );
+            assert_eq!(
+                ok_count, count,
+                "iteration {iteration}: Ok registrations ({ok_count}) must equal the final connection_count ({count})"
+            );
         }
     }
 }

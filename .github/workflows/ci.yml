@@ -42,6 +42,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --locked
 
+  deps:
+    name: cargo-deny
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources
+
   docker:
     name: docker build
     runs-on: ubuntu-24.04
@@ -54,15 +63,21 @@ jobs:
           docker run --rm -d --name zatat-smoke -p 18080:8080 \
             -v "$PWD/zatat.toml.example":/etc/zatat/zatat.toml \
             zatat:ci
+          ok=0
           for i in 1 2 3 4 5 6 7 8 9 10; do
             if curl -sf http://127.0.0.1:18080/health >/dev/null; then
               echo "zatat:ci container passed /health"
+              ok=1
               break
             fi
             sleep 1
           done
           docker logs zatat-smoke || true
           docker kill zatat-smoke || true
+          if [ "$ok" != 1 ]; then
+            echo "zatat:ci container never became healthy" >&2
+            exit 1
+          fi
 
   fuzz-smoke:
     name: fuzz targets (30s each)

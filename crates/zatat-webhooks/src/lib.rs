@@ -164,6 +164,13 @@ pub enum WebhookOverflow {
 pub struct WebhookDispatcher {
     tx: mpsc::Sender<(String, WebhookEvent)>,
     overflow: WebhookOverflow,
+    /// Only `Some` when `overflow` is `Block`. The producer side sends here
+    /// synchronously (never blocks, never spawns); a single dedicated
+    /// forwarder task drains it in order into the bounded `tx` queue,
+    /// awaiting a slot as needed. This preserves enqueue order and avoids
+    /// the per-message `tokio::spawn` pattern that let a stalled consumer
+    /// accumulate unbounded tasks.
+    block_tx: Option<mpsc::UnboundedSender<(String, WebhookEvent)>>,
     drops_total: Arc<AtomicU64>,
     last_drop_warn: Arc<Mutex<Option<Instant>>>,
     in_flight: Arc<AtomicU64>,
@@ -228,9 +235,29 @@ impl WebhookDispatcher {
             }
         });
 
+        // In `Block` mode, a single dedicated forwarder task drains an
+        // unbounded queue into the bounded `tx`, one item at a time,
+        // preserving order without spawning a task per message.
+        let block_tx = if overflow == WebhookOverflow::Block {
+            let bounded_tx = tx.clone();
+            let (unbounded_tx, mut unbounded_rx) =
+                mpsc::unbounded_channel::<(String, WebhookEvent)>();
+            tokio::spawn(async move {
+                while let Some(item) = unbounded_rx.recv().await {
+                    if bounded_tx.send(item).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            Some(unbounded_tx)
+        } else {
+            None
+        };
+
         Self {
             tx,
             overflow,
+            block_tx,
             drops_total: Arc::new(AtomicU64::new(0)),
             last_drop_warn: Arc::new(Mutex::new(None)),
             in_flight,
@@ -264,16 +291,15 @@ impl WebhookDispatcher {
                 }
             }
             WebhookOverflow::Block => {
-                // Queue is full → spawn a task that awaits a slot. Zero
-                // loss. A sustained overload backs up until Redis/consumer
+                // Hand off to the unbounded `block_tx`; the single forwarder
+                // task drains it into the bounded queue in order. Zero
+                // loss. A sustained overload backs up until the consumer
                 // catches up, so the caller still returns immediately but
                 // in-memory pressure rises. The queue-depth gauge is the
                 // load-shedding signal.
-                let tx = self.tx.clone();
-                let entry = (app_id.to_string(), event);
-                tokio::spawn(async move {
-                    let _ = tx.send(entry).await;
-                });
+                if let Some(block_tx) = &self.block_tx {
+                    let _ = block_tx.send((app_id.to_string(), event));
+                }
             }
         }
     }
@@ -307,6 +333,10 @@ fn matches_filters(target: &CompiledTarget, event: &WebhookEvent) -> bool {
     true
 }
 
+fn should_retry(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 408 | 429) || status.is_server_error()
+}
+
 async fn deliver(client: reqwest::Client, target: CompiledTarget, event: WebhookEvent) {
     let envelope = json!({
         "time_ms": now_millis(),
@@ -332,7 +362,12 @@ async fn deliver(client: reqwest::Client, target: CompiledTarget, event: Webhook
                 return;
             }
             Ok(r) => {
-                warn!(app = %target.app_id, url = %target.url, status = %r.status(), "webhook non-2xx");
+                let status = r.status();
+                warn!(app = %target.app_id, url = %target.url, %status, "webhook non-2xx");
+                if !should_retry(status) {
+                    warn!(app = %target.app_id, url = %target.url, %status, "webhook failure is permanent — not retrying");
+                    return;
+                }
             }
             Err(err) => {
                 warn!(app = %target.app_id, url = %target.url, %err, "webhook transport error");
@@ -363,6 +398,22 @@ fn now_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn should_retry_transient_statuses() {
+        assert!(should_retry(reqwest::StatusCode::REQUEST_TIMEOUT));
+        assert!(should_retry(reqwest::StatusCode::TOO_MANY_REQUESTS));
+        assert!(should_retry(reqwest::StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(should_retry(reqwest::StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    #[test]
+    fn should_retry_permanent_statuses() {
+        assert!(!should_retry(reqwest::StatusCode::BAD_REQUEST));
+        assert!(!should_retry(reqwest::StatusCode::UNAUTHORIZED));
+        assert!(!should_retry(reqwest::StatusCode::NOT_FOUND));
+        assert!(!should_retry(reqwest::StatusCode::GONE));
+    }
 
     #[test]
     fn signature_round_trip() {

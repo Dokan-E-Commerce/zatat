@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 use zatat_connection::{Connection, ConnectionHandle, Outbound, RateLimiter};
 use zatat_core::application::{AcceptClientEventsFrom, AppArc};
 use zatat_core::channel_name::{
-    ChannelKind, ChannelName, MAX_CHANNEL_NAME_LEN, MAX_EVENT_NAME_LEN,
+    is_valid_channel_name, ChannelKind, ChannelName, MAX_CHANNEL_NAME_LEN, MAX_EVENT_NAME_LEN,
 };
 use zatat_core::error::PusherError;
 use zatat_core::id::SocketId;
@@ -275,6 +275,9 @@ async fn handle_subscribe(
     if channel_name.len() > MAX_CHANNEL_NAME_LEN {
         return Ok(Some(outbound::error(&PusherError::InvalidMessageFormat)));
     }
+    if !is_valid_channel_name(channel_name) {
+        return Ok(Some(outbound::error(&PusherError::InvalidMessageFormat)));
+    }
     let name = ChannelName::new(channel_name.to_string());
     let kind = name.kind();
 
@@ -301,6 +304,12 @@ async fn handle_subscribe(
         let Some(cd_str) = channel_data else {
             return Ok(Some(outbound::error(&PusherError::InvalidMessageFormat)));
         };
+        if cd_str.len() > app.max_presence_member_size_bytes as usize {
+            return Ok(Some(outbound::error_with_message(
+                4301,
+                "Presence member data exceeds limit",
+            )));
+        }
         let parsed: Value = serde_json::from_str(cd_str)
             .map_err(|_| ())
             .unwrap_or(Value::Null);
@@ -312,6 +321,16 @@ async fn handle_subscribe(
         let Some(user_id) = user_id else {
             return Ok(Some(outbound::error(&PusherError::InvalidMessageFormat)));
         };
+        if let Some(existing) = state.channels.find_channel(&app.id, channel_name) {
+            if existing.user_count() >= app.max_presence_members_per_channel as usize
+                && !existing.has_user_id(&user_id)
+            {
+                return Ok(Some(outbound::error_with_message(
+                    4301,
+                    "Presence channel is over capacity",
+                )));
+            }
+        }
         let user_info = parsed.get("user_info").cloned();
         Some(PresenceMember { user_id, user_info })
     } else {
@@ -325,6 +344,7 @@ async fn handle_subscribe(
         handle.clone(),
         presence.clone(),
     );
+    conn.add_subscription(channel_name);
 
     // subscription_succeeded must flush before member_added so the joining
     // client binds listeners before peers see the add.
@@ -462,6 +482,7 @@ async fn handle_unsubscribe(
         .channels
         .unsubscribe(&app.id, channel_name, &conn.socket_id);
     if let Some(outcome) = outcome {
+        conn.remove_subscription(channel_name);
         let kind = ChannelKind::from_name(channel_name);
         if outcome.was_member && kind.is_presence() {
             if let Some(user_id) = outcome.user_removed.as_deref() {
@@ -517,7 +538,7 @@ async fn handle_unsubscribe(
                 .dispatcher
                 .publish_subscription_count(app, channel_name.to_string(), local_count);
         }
-        if outcome.member_count == 0 {
+        if outcome.was_member && outcome.member_count == 0 {
             state.webhooks.enqueue(
                 app.id.as_str(),
                 WebhookEvent::ChannelVacated {
@@ -665,11 +686,7 @@ async fn handle_client_event(
     let Some(channel) = state.channels.find_channel(&app.id, channel_name) else {
         return Ok(Some(outbound::error(&PusherError::NotChannelMember)));
     };
-    let members = channel.members_iter();
-    if !members
-        .iter()
-        .any(|(sid, _, _)| sid == conn.socket_id.as_str())
-    {
+    if !channel.contains(conn.socket_id.as_str()) {
         return Ok(Some(outbound::error(&PusherError::NotChannelMember)));
     }
     // Note: non-private channels already rejected above (line ~640); no
@@ -745,15 +762,10 @@ async fn cleanup_connection(
     conn: &Arc<Connection>,
     socket_id: &SocketId,
 ) {
-    for ch in state.channels.channels(&app.id) {
-        let had = ch
-            .members_iter()
-            .iter()
-            .any(|(sid, _, _)| sid == socket_id.as_str());
-        if !had {
+    for name in conn.subscriptions_snapshot() {
+        let Some(ch) = state.channels.find_channel(&app.id, &name) else {
             continue;
-        }
-        let name = ch.name().as_str().to_string();
+        };
         let kind = ch.kind();
         if let Some(outcome) = state.channels.unsubscribe(&app.id, &name, socket_id) {
             if outcome.was_member && kind.is_presence() {

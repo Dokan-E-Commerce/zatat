@@ -1,0 +1,12 @@
+target/
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
+tests/
+bench/
+terraform/
+terraform-mena/
+.git/
+.github/
+*.md
+zatat.dev.toml

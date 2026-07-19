@@ -65,17 +65,17 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Cmd {
     Start {
-        #[arg(long, default_value = "zatat.toml")]
+        #[arg(long, env = "ZATAT_CONFIG", default_value = "zatat.toml")]
         config: PathBuf,
         #[arg(long)]
         debug: bool,
     },
     Restart {
-        #[arg(long, default_value = "zatat.toml")]
+        #[arg(long, env = "ZATAT_CONFIG", default_value = "zatat.toml")]
         config: PathBuf,
     },
     Ping {
-        #[arg(long, default_value = "zatat.toml")]
+        #[arg(long, env = "ZATAT_CONFIG", default_value = "zatat.toml")]
         config: PathBuf,
     },
 }
@@ -464,15 +464,29 @@ async fn restart(config_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A bind address (e.g. `0.0.0.0` or `::`) tells the server to listen on
+/// every interface — it isn't itself something a client can connect to.
+/// For `ping` we substitute the loopback address so the check actually
+/// dials a reachable endpoint.
+fn connect_host(host: &str) -> &str {
+    match host {
+        "0.0.0.0" | "::" => "127.0.0.1",
+        other => other,
+    }
+}
+
 async fn ping(config_path: &Path) -> Result<()> {
     let config = Config::load(config_path)?;
     let url = format!(
         "http://{}:{}/health",
         config.server.host, config.server.port
     );
-    match tokio::net::TcpStream::connect(format!("{}:{}", config.server.host, config.server.port))
-        .await
-    {
+    let connect_addr = format!(
+        "{}:{}",
+        connect_host(&config.server.host),
+        config.server.port
+    );
+    match tokio::net::TcpStream::connect(connect_addr).await {
         Ok(_) => {
             println!("{url}: reachable");
             Ok(())

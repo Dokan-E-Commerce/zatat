@@ -3093,6 +3093,7 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "toml",
+ "tracing",
  "zatat-core",
 ]
 
@@ -3215,6 +3216,7 @@ name = "zatat-ws"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "dashmap",
  "futures",
  "metrics",
  "parking_lot",

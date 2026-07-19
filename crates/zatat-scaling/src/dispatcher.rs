@@ -1,7 +1,8 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+use futures::future::join_all;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tracing::warn;
@@ -18,7 +19,7 @@ use zatat_protocol::envelope::encode_envelope_raw_data;
 
 use crate::message::{
     AppRef, ChannelCount, ChannelMetric, MetricsQuery, PresenceSnapshotMember, ScalingEnvelope,
-    ScalingPayload, SCALING_VERSION,
+    ScalingPayload, SCALING_VERSION, SNAPSHOT_TTL,
 };
 use crate::peer_state::{PeerChannelCounts, PeerUserSessions};
 use crate::presence_cache::PresenceCache;
@@ -26,32 +27,72 @@ use crate::provider::PubSubProvider;
 
 /// Encrypts `private-encrypted-*` payloads server-side when the app has a
 /// master key configured and the client did not already encrypt the payload.
-fn maybe_encrypt(app: &AppArc, kind: ChannelKind, channel_name: &str, data: &str) -> String {
+/// Returns `None` when the event cannot be safely encrypted — the caller
+/// must drop it rather than silently downgrade an encrypted channel to
+/// plaintext.
+fn maybe_encrypt(
+    app: &AppArc,
+    kind: ChannelKind,
+    channel_name: &str,
+    data: &str,
+) -> Option<String> {
     if !kind.is_encrypted() {
-        return data.to_string();
+        return Some(data.to_string());
+    }
+    if looks_encrypted(data) {
+        return Some(data.to_string());
     }
     let Some(master_b64) = app.encryption_master_key.as_deref() else {
-        return data.to_string();
+        warn!(app = %app.id, "no encryption_master_key configured for encrypted channel; dropping event");
+        return None;
     };
-    if looks_encrypted(data) {
-        return data.to_string();
-    }
     let master = match decode_master_key(master_b64) {
         Ok(k) => k,
         Err(err) => {
-            warn!(app = %app.id, %err, "invalid encryption_master_key; broadcast passed through");
-            return data.to_string();
+            warn!(app = %app.id, %err, "invalid encryption_master_key; dropping event");
+            return None;
         }
     };
     let secret = derive_shared_secret(channel_name, &master);
     match encrypt_payload(data.as_bytes(), &secret) {
-        Ok(s) => s,
+        Ok(s) => Some(s),
         Err(err) => {
-            warn!(%err, "encryption failed; broadcast passed through");
-            data.to_string()
+            warn!(%err, "encryption failed; dropping event");
+            None
         }
     }
 }
+
+/// Extracts the node id carried by a payload variant, if any, so
+/// `handle_incoming` can refresh `peers_seen` before acting on the payload.
+/// `Terminate` carries no node id (it targets a socket, not a peer) and
+/// returns `None`.
+fn payload_node_id(payload: &ScalingPayload) -> Option<&str> {
+    match payload {
+        ScalingPayload::Message { origin_node_id, .. }
+        | ScalingPayload::TerminateUser { origin_node_id, .. }
+        | ScalingPayload::ClientEvent { origin_node_id, .. }
+        | ScalingPayload::UserEvent { origin_node_id, .. }
+        | ScalingPayload::MemberAdded { origin_node_id, .. }
+        | ScalingPayload::MemberRemoved { origin_node_id, .. }
+        | ScalingPayload::SubscriptionCount { origin_node_id, .. }
+        | ScalingPayload::UserOnline { origin_node_id, .. }
+        | ScalingPayload::UserOffline { origin_node_id, .. } => Some(origin_node_id.as_str()),
+        ScalingPayload::PresenceSnapshot { node_id, .. }
+        | ScalingPayload::MetricsResponse { node_id, .. }
+        | ScalingPayload::ChannelCountSnapshot { node_id, .. }
+        | ScalingPayload::UserSessionSnapshot { node_id, .. } => Some(node_id.as_str()),
+        ScalingPayload::MetricsRequest {
+            requester_node_id, ..
+        } => Some(requester_node_id.as_str()),
+        ScalingPayload::Terminate { .. } => None,
+    }
+}
+
+/// Per-request fan-in for `ask_fleet_for_channels`: each responding peer's
+/// `MetricsResponse` is forwarded whole, tagged with its node id, so the
+/// receive loop can track distinct responders and exit early.
+type MetricsInflightTx = mpsc::UnboundedSender<(String, Vec<ChannelMetric>)>;
 
 /// Bounded queue for the outbound publisher worker. Sized so a short
 /// Redis hiccup (up to a few seconds at steady-state rates) can be absorbed
@@ -84,11 +125,24 @@ pub struct EventDispatcher {
     presence_cache: Arc<PresenceCache>,
     peer_channel_counts: Arc<PeerChannelCounts>,
     peer_user_sessions: Arc<PeerUserSessions>,
-    metrics_inflight: Arc<DashMap<String, mpsc::UnboundedSender<ChannelMetric>>>,
+    /// Last time each peer node id was observed on the scaling bus (any
+    /// payload variant that carries an origin/requester/node id). Refreshed
+    /// in `handle_incoming` before the per-variant dispatch. Lets
+    /// `ask_fleet_for_channels` know how many peers to expect a reply from,
+    /// instead of always waiting out the full timeout.
+    peers_seen: Arc<DashMap<String, Instant>>,
+    metrics_inflight: Arc<DashMap<String, MetricsInflightTx>>,
     /// Outbound publisher channel. `None` when scaling is disabled.
     publish_tx: Option<mpsc::Sender<Vec<u8>>>,
     /// What to do when `publish_tx` is full.
     publish_overflow: PublishOverflow,
+    /// Only `Some` when `publish_overflow` is `Block`. The producer side
+    /// sends here synchronously (never blocks, never spawns); a single
+    /// dedicated forwarder task drains it in order into the bounded
+    /// `publish_tx` queue, awaiting a slot as needed. This preserves publish
+    /// order and avoids the per-message `tokio::spawn` pattern that let a
+    /// stalled consumer accumulate unbounded tasks.
+    block_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
     /// Count of publish attempts that were dropped because the queue was
     /// full. Exposed via `publish_drops_total()` for tests + the
     /// `zatat_scaling_publish_drops_total` metric.
@@ -135,6 +189,25 @@ impl EventDispatcher {
             None
         };
 
+        // In `Block` mode, a single dedicated forwarder task drains an
+        // unbounded queue into the bounded `publish_tx`, one item at a time,
+        // preserving order without spawning a task per message.
+        let block_tx = if publish_overflow == PublishOverflow::Block {
+            publish_tx.clone().map(|bounded_tx| {
+                let (unbounded_tx, mut unbounded_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+                tokio::spawn(async move {
+                    while let Some(item) = unbounded_rx.recv().await {
+                        if bounded_tx.send(item).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                unbounded_tx
+            })
+        } else {
+            None
+        };
+
         Self {
             channels,
             provider,
@@ -143,9 +216,11 @@ impl EventDispatcher {
             presence_cache: Arc::new(PresenceCache::new()),
             peer_channel_counts: Arc::new(PeerChannelCounts::new()),
             peer_user_sessions: Arc::new(PeerUserSessions::new()),
+            peers_seen: Arc::new(DashMap::new()),
             metrics_inflight: Arc::new(DashMap::new()),
             publish_tx,
             publish_overflow,
+            block_tx,
             publish_drops_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_publish_drop_warn: Arc::new(parking_lot::Mutex::new(None)),
             last_future_version_warn: Arc::new(parking_lot::Mutex::new(None)),
@@ -214,6 +289,17 @@ impl EventDispatcher {
         self.peer_user_sessions.clone()
     }
 
+    /// Number of distinct peer nodes seen on the scaling bus within
+    /// `SNAPSHOT_TTL`. Presence heartbeats land every 5s and the TTL is 15s,
+    /// so a live fleet member is reflected here within one heartbeat.
+    pub fn live_peer_count(&self) -> usize {
+        let now = Instant::now();
+        self.peers_seen
+            .iter()
+            .filter(|e| now.duration_since(*e.value()) <= SNAPSHOT_TTL)
+            .count()
+    }
+
     pub fn channels(&self) -> &ChannelManager {
         &self.channels
     }
@@ -227,7 +313,9 @@ impl EventDispatcher {
         except_socket_id: Option<SocketId>,
     ) {
         let kind = ChannelKind::from_name(&channel_name);
-        let data = maybe_encrypt(&app, kind, &channel_name, &data);
+        let Some(data) = maybe_encrypt(&app, kind, &channel_name, &data) else {
+            return;
+        };
 
         // Pass the AppArc so cache-* channels can be created on demand to
         // retain the payload for late subscribers.
@@ -529,10 +617,10 @@ impl EventDispatcher {
     /// Enqueue an envelope for the publisher worker. Behavior when the
     /// queue is full depends on `publish_overflow`:
     ///   - `BestEffort` (default): drop + count + throttled warn.
-    ///   - `Block`: spawn a task that awaits a slot (zero loss, background
-    ///     back-pressure). We can't block the sync caller directly because
-    ///     `spawn_publish` runs on the WS hot path; the spawned task keeps
-    ///     the envelope alive until Redis catches up.
+    ///   - `Block`: hand off to the unbounded `block_tx`, which the single
+    ///     forwarder task drains into the bounded queue in order. Zero loss,
+    ///     and — unlike a per-message `tokio::spawn` — publish order is
+    ///     preserved and a stalled consumer can't accumulate unbounded tasks.
     fn spawn_publish(&self, env: ScalingEnvelope) {
         let Some(tx) = &self.publish_tx else {
             return;
@@ -569,10 +657,9 @@ impl EventDispatcher {
                 }
             }
             PublishOverflow::Block => {
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    let _ = tx.send(bytes).await;
-                });
+                if let Some(block_tx) = &self.block_tx {
+                    let _ = block_tx.send(bytes);
+                }
             }
         }
     }
@@ -589,6 +676,11 @@ impl EventDispatcher {
         if env.version > SCALING_VERSION {
             self.log_future_version(env.version);
             return;
+        }
+        if let Some(id) = payload_node_id(&env.payload) {
+            if id != self.node_id {
+                self.peers_seen.insert(id.to_string(), Instant::now());
+            }
         }
         let Some(app) = apps_by_id_lookup(&AppId::from(env.app.id.as_str())) else {
             return;
@@ -688,17 +780,15 @@ impl EventDispatcher {
             }
             ScalingPayload::MetricsResponse {
                 request_id,
+                node_id,
                 channels: metrics,
-                ..
             } => {
                 // Keep the sender registered: peers may each respond.
                 // The originator unregisters when the wait window closes.
                 if let Some(entry) = self.metrics_inflight.get(&request_id) {
                     let tx = entry.clone();
                     drop(entry);
-                    for m in metrics {
-                        let _ = tx.send(m);
-                    }
+                    let _ = tx.send((node_id, metrics));
                 }
             }
             ScalingPayload::MemberAdded {
@@ -800,7 +890,7 @@ impl EventDispatcher {
                 zatat_protocol::outbound::member_added(&channel, &user_id, user_info.as_ref());
             if let Some(ch) = self.channels.find_channel(&app.id, &channel) {
                 let arc: Arc<str> = Arc::from(frame.into_boxed_str());
-                ch.broadcast(arc, None);
+                ch.broadcast_protocol(arc, None);
             }
         }
     }
@@ -828,7 +918,7 @@ impl EventDispatcher {
             let frame = zatat_protocol::outbound::member_removed(&channel, &user_id);
             if let Some(ch) = self.channels.find_channel(&app.id, &channel) {
                 let arc: Arc<str> = Arc::from(frame.into_boxed_str());
-                ch.broadcast(arc, None);
+                ch.broadcast_protocol(arc, None);
             }
         }
     }
@@ -856,7 +946,7 @@ impl EventDispatcher {
         let total = local_count + peer_sum;
         let frame = zatat_protocol::outbound::subscription_count(&channel, total);
         let arc: Arc<str> = Arc::from(frame.into_boxed_str());
-        ch.broadcast(arc, None);
+        ch.broadcast_protocol(arc, None);
     }
 
     fn apply_remote_user_online(&self, app: &AppArc, origin_node_id: String, user_id: String) {
@@ -918,7 +1008,7 @@ impl EventDispatcher {
             let total = ch.len() + self.peer_channel_counts.sum(app.id.as_str(), &c.channel);
             let frame = zatat_protocol::outbound::subscription_count(&c.channel, total);
             let arc: Arc<str> = Arc::from(frame.into_boxed_str());
-            ch.broadcast(arc, None);
+            ch.broadcast_protocol(arc, None);
         }
     }
 
@@ -1038,6 +1128,13 @@ impl EventDispatcher {
 
     /// Fires a MetricsRequest on the scaling bus and collects responses
     /// until `wait` elapses. Returns `None` when scaling is disabled.
+    ///
+    /// Exits early once every peer known to be live (seen on the bus within
+    /// `SNAPSHOT_TTL`) has answered, instead of always waiting out `wait`.
+    /// At startup — before any peer has been observed — `live_peer_count()`
+    /// is 0 and we conservatively fall back to the full wait, since we can't
+    /// yet tell whether the fleet has zero peers or we simply haven't heard
+    /// from them.
     pub async fn ask_fleet_for_channels(
         &self,
         app: &AppArc,
@@ -1047,8 +1144,9 @@ impl EventDispatcher {
         if !self.scaling_enabled {
             return None;
         }
+        let expected = self.live_peer_count();
         let request_id = Uuid::new_v4().to_string();
-        let (tx, mut rx) = mpsc::unbounded_channel::<ChannelMetric>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<(String, Vec<ChannelMetric>)>();
         self.metrics_inflight.insert(request_id.clone(), tx);
 
         let env = ScalingEnvelope {
@@ -1066,6 +1164,7 @@ impl EventDispatcher {
         self.spawn_publish(env);
 
         let mut out: Vec<ChannelMetric> = Vec::new();
+        let mut responders: std::collections::HashSet<String> = std::collections::HashSet::new();
         let deadline = tokio::time::Instant::now() + wait;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -1073,12 +1172,30 @@ impl EventDispatcher {
                 break;
             }
             match tokio::time::timeout(remaining, rx.recv()).await {
-                Ok(Some(m)) => out.push(m),
+                Ok(Some((node_id, metrics))) => {
+                    out.extend(metrics);
+                    responders.insert(node_id);
+                    if expected > 0 && responders.len() >= expected {
+                        break;
+                    }
+                }
                 _ => break,
             }
         }
         self.metrics_inflight.remove(&request_id);
         Some(out)
+    }
+
+    /// Test-only escape hatch to fetch the currently pending
+    /// `ask_fleet_for_channels` request id(s) without threading it through
+    /// the return value. Used to simulate a peer's `MetricsResponse` landing
+    /// mid-wait.
+    #[cfg(test)]
+    pub fn inflight_request_ids(&self) -> Vec<String> {
+        self.metrics_inflight
+            .iter()
+            .map(|e| e.key().clone())
+            .collect()
     }
 
     pub fn broadcast_locally(
@@ -1137,16 +1254,31 @@ impl EventDispatcher {
     }
 }
 
-/// Long-lived publisher worker: drains the outbound queue and calls
-/// `provider.publish` serially. Each call is bounded by a 2s timeout so a
-/// stalled Redis doesn't park the worker forever. Latency is recorded as
-/// `zatat_scaling_publish_latency_seconds` so operators can set SLOs.
+/// Long-lived publisher worker: drains the outbound queue in batches of up
+/// to 64 and fires `provider.publish` for the whole batch at once via
+/// `join_all`. `join_all`'s first poll pass polls the futures in order, so
+/// fred (which multiplexes over one connection and enqueues a command the
+/// moment its future is first polled) still issues the underlying PUBLISHes
+/// in enqueue order — publish order is preserved even though the round
+/// trips now overlap instead of running one-at-a-time. Each batch is bounded
+/// by a 5s timeout so a stalled Redis doesn't park the worker forever.
+/// Latency is recorded per-batch as `zatat_scaling_publish_latency_seconds`;
+/// `zatat_scaling_publish_batch_size` tracks how much pipelining is
+/// actually happening.
 async fn run_publisher(mut rx: mpsc::Receiver<Vec<u8>>, provider: Arc<dyn PubSubProvider>) {
-    while let Some(bytes) = rx.recv().await {
+    let mut buf: Vec<Vec<u8>> = Vec::with_capacity(64);
+    loop {
+        let n = rx.recv_many(&mut buf, 64).await;
+        if n == 0 {
+            break;
+        }
+        let batch_size = buf.len();
         let start = std::time::Instant::now();
-        let _ = timeout(Duration::from_secs(2), provider.publish(bytes)).await;
+        let publishes = buf.drain(..).map(|bytes| provider.publish(bytes));
+        let _ = timeout(Duration::from_secs(5), join_all(publishes)).await;
         let elapsed = start.elapsed();
         metrics::histogram!("zatat_scaling_publish_latency_seconds").record(elapsed.as_secs_f64());
+        metrics::histogram!("zatat_scaling_publish_batch_size").record(batch_size as f64);
     }
 }
 
@@ -1156,7 +1288,9 @@ mod tests {
     use crate::message::{AppRef, ScalingEnvelope, ScalingPayload};
     use crate::provider::LocalOnlyProvider;
     use zatat_channels::ChannelManager;
+    use zatat_connection::{ConnectionHandle, Outbound};
     use zatat_core::application::{AcceptClientEventsFrom, Application};
+    use zatat_core::channel_name::ChannelName;
 
     fn mk_app() -> AppArc {
         std::sync::Arc::new(
@@ -1221,6 +1355,44 @@ mod tests {
             dispatcher.future_version_drops(),
             1,
             "current version must not count as a drop"
+        );
+    }
+
+    /// Regression: `maybe_encrypt` used to fall back to plaintext when the
+    /// app had no `encryption_master_key`, silently downgrading a
+    /// `private-encrypted-*` channel. Now the event must be dropped instead
+    /// of reaching any local subscriber.
+    #[tokio::test]
+    async fn dispatch_drops_encrypted_event_without_master_key() {
+        let channels = ChannelManager::new();
+        let provider = std::sync::Arc::new(LocalOnlyProvider);
+        let dispatcher = EventDispatcher::new(channels.clone(), provider, false);
+        let app = mk_app();
+        assert!(app.encryption_master_key.is_none());
+
+        let channel_name = ChannelName::new("private-encrypted-secret");
+        let socket_id = SocketId::from_string("1.1".into());
+        let (tx, mut rx) = mpsc::channel::<Outbound>(8);
+        let handle = ConnectionHandle::from_parts(
+            socket_id.clone(),
+            tx,
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+        );
+        channels.subscribe(&app, &channel_name, socket_id, handle, None);
+
+        dispatcher
+            .dispatch_message(
+                app,
+                channel_name.as_str().to_string(),
+                "my-event".to_string(),
+                "top secret".to_string(),
+                None,
+            )
+            .await;
+
+        assert!(
+            rx.try_recv().is_err(),
+            "subscriber must not receive a private-encrypted event when no master key is configured"
         );
     }
 
@@ -1293,6 +1465,280 @@ mod tests {
         assert!(
             dispatcher.publish_drops_total() > 0,
             "expected some drops when burst ({burst}) exceeds capacity ({PUBLISH_QUEUE_CAPACITY}); got 0"
+        );
+    }
+
+    /// Regression: `apply_remote_subscription_count` used to call
+    /// `ch.broadcast(...)`, which — on a cache channel — overwrites the
+    /// cached payload with the protocol frame itself. A late subscriber
+    /// would then replay `pusher_internal:subscription_count` as if it were
+    /// the last real event payload. It must use `broadcast_protocol` so the
+    /// cache is left untouched.
+    #[tokio::test]
+    async fn remote_subscription_count_does_not_overwrite_cache_payload() {
+        let channels = ChannelManager::new();
+        let provider = std::sync::Arc::new(LocalOnlyProvider);
+        let dispatcher = EventDispatcher::new(channels.clone(), provider, true);
+        let app = mk_app();
+
+        let channel_name = ChannelName::new("cache-room");
+        let socket_id = SocketId::from_string("1.1".into());
+        let (tx, mut rx) = mpsc::channel::<Outbound>(8);
+        let handle = ConnectionHandle::from_parts(
+            socket_id.clone(),
+            tx,
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+        );
+        channels.subscribe(&app, &channel_name, socket_id, handle, None);
+
+        let cached: Arc<str> = Arc::from(
+            "{\"event\":\"e\",\"data\":\"1\"}"
+                .to_string()
+                .into_boxed_str(),
+        );
+        channels
+            .find_channel(&app.id, "cache-room")
+            .expect("channel exists after subscribe")
+            .set_cached_payload(cached.clone());
+
+        let env = ScalingEnvelope {
+            version: SCALING_VERSION,
+            app: AppRef {
+                id: "app-1".into(),
+                key: "dev-key".into(),
+            },
+            payload: ScalingPayload::SubscriptionCount {
+                origin_node_id: "other-node".into(),
+                channel: "cache-room".into(),
+                count: 3,
+            },
+        };
+        dispatcher.handle_incoming(env, |_id| Some(app.clone()));
+
+        assert!(
+            rx.try_recv().is_ok(),
+            "subscriber must still receive the subscription_count frame"
+        );
+        assert_eq!(
+            channels
+                .find_channel(&app.id, "cache-room")
+                .expect("channel still exists")
+                .cached_payload(),
+            Some(cached),
+            "remote subscription_count must not overwrite the cached payload"
+        );
+    }
+
+    /// Same regression as above, for `apply_remote_member_added` on a
+    /// presence-cache channel: the `member_added` protocol frame must not
+    /// clobber the channel's cached payload.
+    #[tokio::test]
+    async fn remote_member_added_does_not_overwrite_presence_cache_payload() {
+        let channels = ChannelManager::new();
+        let provider = std::sync::Arc::new(LocalOnlyProvider);
+        let dispatcher = EventDispatcher::new(channels.clone(), provider, true);
+        let app = mk_app();
+
+        let channel_name = ChannelName::new("presence-cache-room");
+        let socket_id = SocketId::from_string("1.1".into());
+        let (tx, mut rx) = mpsc::channel::<Outbound>(8);
+        let handle = ConnectionHandle::from_parts(
+            socket_id.clone(),
+            tx,
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+        );
+        channels.subscribe(&app, &channel_name, socket_id, handle, None);
+
+        let cached: Arc<str> = Arc::from(
+            "{\"event\":\"e\",\"data\":\"1\"}"
+                .to_string()
+                .into_boxed_str(),
+        );
+        channels
+            .find_channel(&app.id, "presence-cache-room")
+            .expect("channel exists after subscribe")
+            .set_cached_payload(cached.clone());
+
+        let env = ScalingEnvelope {
+            version: SCALING_VERSION,
+            app: AppRef {
+                id: "app-1".into(),
+                key: "dev-key".into(),
+            },
+            payload: ScalingPayload::MemberAdded {
+                origin_node_id: "other-node".into(),
+                channel: "presence-cache-room".into(),
+                user_id: "u9".into(),
+                user_info: None,
+            },
+        };
+        dispatcher.handle_incoming(env, |_id| Some(app.clone()));
+
+        assert!(
+            rx.try_recv().is_ok(),
+            "subscriber must still receive the member_added frame"
+        );
+        assert_eq!(
+            channels
+                .find_channel(&app.id, "presence-cache-room")
+                .expect("channel still exists")
+                .cached_payload(),
+            Some(cached),
+            "remote member_added must not overwrite the cached payload"
+        );
+    }
+
+    /// Stand-in publisher that records every published payload at future
+    /// entry — i.e. synchronously, before the first `.await` point — and
+    /// only then sleeps briefly. Since `join_all` polls a batch's futures in
+    /// order on its first poll pass, and each future's body runs
+    /// synchronously up to its first await, the recorded order reflects
+    /// enqueue order regardless of how the sleeps subsequently resolve.
+    struct RecordingProvider {
+        recorded: Arc<parking_lot::Mutex<Vec<Vec<u8>>>>,
+    }
+    #[async_trait::async_trait]
+    impl PubSubProvider for RecordingProvider {
+        async fn publish(&self, payload: Vec<u8>) {
+            self.recorded.lock().push(payload);
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        async fn subscribe(&self) -> Result<tokio::sync::broadcast::Receiver<Vec<u8>>, String> {
+            let (_tx, rx) = tokio::sync::broadcast::channel(1);
+            Ok(rx)
+        }
+    }
+
+    /// Regression: `Block` mode used to `tokio::spawn` a task per publish,
+    /// which gave no ordering guarantee between publishes racing to acquire
+    /// a slot in the bounded queue. It now routes through a single dedicated
+    /// forwarder task, so publish order must be preserved end-to-end.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn block_mode_preserves_publish_order() {
+        let channels = ChannelManager::new();
+        let recorded = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let provider = std::sync::Arc::new(RecordingProvider {
+            recorded: recorded.clone(),
+        });
+        let dispatcher =
+            EventDispatcher::with_overflow(channels, provider, true, PublishOverflow::Block);
+        let app = mk_app();
+
+        const N: usize = 200;
+        for i in 0..N {
+            dispatcher
+                .publish_terminate(&app, SocketId::from_string(format!("1.{i}")))
+                .await;
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if recorded.lock().len() >= N {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for the recorder to observe all {N} publishes"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let recorded = recorded.lock();
+        assert_eq!(recorded.len(), N);
+        for (i, bytes) in recorded.iter().enumerate() {
+            let env: ScalingEnvelope =
+                serde_json::from_slice(bytes).expect("recorded payload must be a valid envelope");
+            match env.payload {
+                ScalingPayload::Terminate { socket_id } => {
+                    assert_eq!(
+                        socket_id,
+                        format!("1.{i}"),
+                        "publish order must be preserved under Block overflow"
+                    );
+                }
+                other => panic!("unexpected payload at position {i}: {other:?}"),
+            }
+        }
+    }
+
+    /// Regression: `ask_fleet_for_channels` used to always wait out the
+    /// full `wait` duration because it had no idea how many peers existed.
+    /// Once a peer has been observed (via any bus payload carrying its node
+    /// id — here a `PresenceSnapshot`), `live_peer_count()` reflects it, and
+    /// the fleet query returns as soon as that many distinct nodes have
+    /// responded rather than waiting for the deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ask_fleet_for_channels_returns_early_once_known_peers_respond() {
+        let channels = ChannelManager::new();
+        let provider = std::sync::Arc::new(LocalOnlyProvider);
+        let dispatcher = Arc::new(EventDispatcher::new(channels, provider, true));
+        let app = mk_app();
+
+        let snapshot_env = ScalingEnvelope {
+            version: SCALING_VERSION,
+            app: AppRef {
+                id: "app-1".into(),
+                key: "dev-key".into(),
+            },
+            payload: ScalingPayload::PresenceSnapshot {
+                node_id: "n1".into(),
+                channel: "presence-room".into(),
+                members: Vec::new(),
+            },
+        };
+        dispatcher.handle_incoming(snapshot_env, |_id| Some(app.clone()));
+        assert_eq!(dispatcher.live_peer_count(), 1);
+
+        let responder = dispatcher.clone();
+        let responder_app = app.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let request_id = responder
+                .inflight_request_ids()
+                .into_iter()
+                .next()
+                .expect("ask_fleet_for_channels request should be in flight");
+            let response_env = ScalingEnvelope {
+                version: SCALING_VERSION,
+                app: AppRef {
+                    id: "app-1".into(),
+                    key: "dev-key".into(),
+                },
+                payload: ScalingPayload::MetricsResponse {
+                    request_id,
+                    node_id: "n1".into(),
+                    channels: vec![ChannelMetric {
+                        name: "room".into(),
+                        occupied: true,
+                        subscription_count: 1,
+                        user_count: None,
+                        has_cached_payload: false,
+                        presence_user_ids: Vec::new(),
+                    }],
+                },
+            };
+            responder.handle_incoming(response_env, |_id| Some(responder_app.clone()));
+        });
+
+        let start = std::time::Instant::now();
+        let result = dispatcher
+            .ask_fleet_for_channels(
+                &app,
+                MetricsQuery {
+                    filter_by_prefix: None,
+                    info: None,
+                },
+                std::time::Duration::from_millis(300),
+            )
+            .await
+            .expect("scaling enabled");
+        let elapsed = start.elapsed();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "room");
+        assert!(
+            elapsed < std::time::Duration::from_millis(250),
+            "expected early return once the known peer responded, took {elapsed:?}"
         );
     }
 }

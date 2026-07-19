@@ -84,6 +84,18 @@ impl ChannelName {
     }
 }
 
+pub fn is_valid_channel_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > MAX_CHANNEL_NAME_LEN {
+        return false;
+    }
+    name.bytes().all(|b| {
+        matches!(
+            b,
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-' | b'=' | b'@' | b',' | b'.' | b';'
+        )
+    })
+}
+
 impl From<String> for ChannelName {
     fn from(s: String) -> Self {
         Self(s)
@@ -135,5 +147,21 @@ mod tests {
         assert!(ChannelKind::PresenceCache.is_presence());
         assert!(ChannelKind::PrivateEncrypted.is_private());
         assert!(ChannelKind::PrivateCache.is_cache());
+    }
+
+    #[test]
+    fn valid_channel_names() {
+        assert!(is_valid_channel_name("private-user.1"));
+        assert!(is_valid_channel_name("presence-room,x;y=z@w"));
+    }
+
+    #[test]
+    fn invalid_channel_names() {
+        assert!(!is_valid_channel_name("#server-to-user-x"));
+        assert!(!is_valid_channel_name("room/1"));
+        assert!(!is_valid_channel_name("room 1"));
+        assert!(!is_valid_channel_name(""));
+        assert!(!is_valid_channel_name("ch:name"));
+        assert!(!is_valid_channel_name(&"a".repeat(165)));
     }
 }

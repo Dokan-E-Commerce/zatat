@@ -105,7 +105,6 @@ pub struct ServerConfig {
     pub host: String,
     pub port: u16,
     pub path: String,
-    pub hostname: Option<String>,
     pub max_request_size: u64,
     pub restart_signal_file: String,
     pub restart_poll_interval: Duration,
@@ -174,7 +173,7 @@ struct RawConfig {
     apps: Vec<RawApp>,
 }
 
-#[derive(Deserialize, Serialize, Debug, Default)]
+#[derive(Deserialize, Serialize, Debug)]
 struct RawServer {
     #[serde(default = "default_host")]
     host: String,
@@ -182,8 +181,6 @@ struct RawServer {
     port: u16,
     #[serde(default)]
     path: String,
-    #[serde(default)]
-    hostname: Option<String>,
     #[serde(default = "default_max_request_size")]
     max_request_size: u64,
     #[serde(default = "default_restart_signal_file")]
@@ -198,6 +195,23 @@ struct RawServer {
     prometheus: Option<RawPrometheus>,
     #[serde(default)]
     webhook_overflow_mode: RawOverflowMode,
+}
+
+impl Default for RawServer {
+    fn default() -> Self {
+        RawServer {
+            host: default_host(),
+            port: default_port(),
+            path: String::default(),
+            max_request_size: default_max_request_size(),
+            restart_signal_file: default_restart_signal_file(),
+            restart_poll_interval_seconds: default_restart_poll(),
+            tls: None,
+            scaling: None,
+            prometheus: None,
+            webhook_overflow_mode: RawOverflowMode::default(),
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -236,7 +250,7 @@ impl From<RawOverflowMode> for OverflowMode {
     }
 }
 
-#[derive(Deserialize, Serialize, Debug, Default)]
+#[derive(Deserialize, Serialize, Debug)]
 struct RawRedis {
     url: Option<String>,
     #[serde(default = "default_redis_host")]
@@ -249,6 +263,20 @@ struct RawRedis {
     password: Option<String>,
     #[serde(default = "default_redis_timeout")]
     timeout_seconds: u64,
+}
+
+impl Default for RawRedis {
+    fn default() -> Self {
+        RawRedis {
+            url: None,
+            host: default_redis_host(),
+            port: default_redis_port(),
+            db: u8::default(),
+            username: None,
+            password: None,
+            timeout_seconds: default_redis_timeout(),
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -287,10 +315,20 @@ struct RawApp {
     /// Cache-channel TTL in seconds. Zero keeps payloads forever.
     #[serde(default = "default_cache_ttl_seconds")]
     cache_ttl_seconds: u64,
+    #[serde(default = "default_max_presence_members")]
+    max_presence_members_per_channel: u32,
+    #[serde(default = "default_max_presence_member_size_bytes")]
+    max_presence_member_size_bytes: u32,
 }
 
 fn default_cache_ttl_seconds() -> u64 {
     1800
+}
+fn default_max_presence_members() -> u32 {
+    100
+}
+fn default_max_presence_member_size_bytes() -> u32 {
+    2048
 }
 
 fn default_host() -> String {
@@ -339,7 +377,6 @@ impl RawConfig {
             host: self.server.host,
             port: self.server.port,
             path: self.server.path,
-            hostname: self.server.hostname,
             max_request_size: self.server.max_request_size,
             restart_signal_file: self.server.restart_signal_file,
             restart_poll_interval: Duration::from_secs(self.server.restart_poll_interval_seconds),
@@ -384,6 +421,12 @@ impl RawConfig {
         let mut by_id: HashMap<AppId, AppArc> = HashMap::new();
         let mut by_key: HashMap<AppKey, AppArc> = HashMap::new();
         for raw in self.apps {
+            if raw.accept_client_events_from == AcceptClientEventsFrom::All {
+                tracing::warn!(
+                    app = %raw.id,
+                    "accept_client_events_from = \"all\" is accepted for compatibility but behaves as \"members\" — channel membership is always required"
+                );
+            }
             let app = Application::new(
                 AppId::from(raw.id.clone()),
                 AppKey::from(raw.key.clone()),
@@ -403,7 +446,11 @@ impl RawConfig {
                 None
             } else {
                 Some(raw.cache_ttl_seconds)
-            });
+            })
+            .with_presence_limits(
+                raw.max_presence_members_per_channel,
+                raw.max_presence_member_size_bytes,
+            );
             let arc = Arc::new(app);
             if by_id.insert(arc.id.clone(), arc.clone()).is_some() {
                 return Err(ConfigError::DuplicateAppId(raw.id));
@@ -441,7 +488,85 @@ allowed_origins = ["*"]
         let cfg = Config::load(&tmp).unwrap();
         assert_eq!(cfg.server.port, 8080);
         assert_eq!(cfg.apps().by_id.len(), 1);
-        assert!(cfg.app_by_key(&AppKey::from("k")).is_some());
+        let app = cfg.app_by_key(&AppKey::from("k")).unwrap();
+        assert_eq!(app.max_presence_members_per_channel, 100);
+        assert_eq!(app.max_presence_member_size_bytes, 2048);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn presence_limits_can_be_overridden() {
+        let tmp = std::env::temp_dir().join("zatat-presence-limits-test.toml");
+        std::fs::write(
+            &tmp,
+            r#"
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[[apps]]
+id = "a"
+key = "k"
+secret = "s"
+allowed_origins = ["*"]
+max_presence_members_per_channel = 5
+max_presence_member_size_bytes = 128
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&tmp).unwrap();
+        let app = cfg.app_by_key(&AppKey::from("k")).unwrap();
+        assert_eq!(app.max_presence_members_per_channel, 5);
+        assert_eq!(app.max_presence_member_size_bytes, 128);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn missing_server_section_uses_field_defaults() {
+        let tmp = std::env::temp_dir().join("zatat-no-server-section-test.toml");
+        std::fs::write(
+            &tmp,
+            r#"
+[[apps]]
+id = "a"
+key = "k"
+secret = "s"
+allowed_origins = ["*"]
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&tmp).unwrap();
+        assert_eq!(cfg.server.host, "0.0.0.0");
+        assert_eq!(cfg.server.port, 8080);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn scaling_without_redis_subsection_uses_redis_defaults() {
+        let tmp = std::env::temp_dir().join("zatat-scaling-no-redis-test.toml");
+        std::fs::write(
+            &tmp,
+            r#"
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[server.scaling]
+enabled = false
+
+[[apps]]
+id = "a"
+key = "k"
+secret = "s"
+allowed_origins = ["*"]
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&tmp).unwrap();
+        let scaling = cfg.server.scaling.as_ref().unwrap();
+        assert!(!scaling.enabled);
+        assert_eq!(scaling.redis.host, "127.0.0.1");
+        assert_eq!(scaling.redis.port, 6379);
         let _ = std::fs::remove_file(&tmp);
     }
 

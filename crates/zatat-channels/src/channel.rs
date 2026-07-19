@@ -69,6 +69,10 @@ impl Channel {
         self.members.is_empty()
     }
 
+    pub fn contains(&self, socket_id: &str) -> bool {
+        self.members.contains_key(socket_id)
+    }
+
     /// Distinct `user_id` count on presence channels; `len()` otherwise.
     pub fn user_count(&self) -> usize {
         match &self.user_refcounts {
@@ -166,12 +170,13 @@ impl Channel {
             Some((_, member)) => {
                 let mut user_removed = None;
                 if let (Some(refs), Some(pm)) = (&self.user_refcounts, member.presence.as_ref()) {
-                    if let Some(mut n) = refs.get_mut(&pm.user_id) {
-                        *n -= 1;
-                    }
-                    let should_drop = refs.get(&pm.user_id).map(|n| *n == 0).unwrap_or(false);
-                    if should_drop {
-                        refs.remove(&pm.user_id);
+                    let reached_zero = if let Some(mut n) = refs.get_mut(&pm.user_id) {
+                        *n = n.saturating_sub(1);
+                        *n == 0
+                    } else {
+                        false
+                    };
+                    if reached_zero && refs.remove_if(&pm.user_id, |_, n| *n == 0).is_some() {
                         user_removed = Some(pm.user_id.clone());
                     }
                 }
@@ -295,5 +300,60 @@ mod tests {
         ch.set_cached_payload(Arc::from("{\"hello\":1}".to_string().into_boxed_str()));
         std::thread::sleep(Duration::from_millis(30));
         assert!(ch.cached_payload().is_some());
+    }
+
+    /// Regression: `unsubscribe` used to decrement the user's refcount, then
+    /// separately re-read it (`refs.get`) and `refs.remove` it, in two
+    /// non-atomic steps. Two sockets for the same presence user_id
+    /// unsubscribing concurrently could both observe the count at zero and
+    /// both report `user_removed`, double-firing `member_removed` upstream.
+    /// The fix folds the zero-check into `remove_if` so exactly one
+    /// unsubscribe wins the race. Runs many iterations with real OS threads
+    /// to shake out the race.
+    #[test]
+    fn concurrent_unsubscribe_reports_user_removed_exactly_once() {
+        for iteration in 0..200 {
+            let ch = Arc::new(Channel::new(ChannelName::new("presence-x".to_string())));
+
+            let presence = PresenceMember {
+                user_id: "u1".to_string(),
+                user_info: None,
+            };
+
+            let socket_a = SocketId::from_string("1.1".into());
+            let (tx_a, _rx_a) = tokio::sync::mpsc::channel(8);
+            let handle_a = ConnectionHandle::from_parts(
+                socket_a.clone(),
+                tx_a,
+                Arc::new(tokio::sync::Notify::new()),
+            );
+            ch.subscribe(socket_a.clone(), handle_a, Some(presence.clone()));
+
+            let socket_b = SocketId::from_string("1.2".into());
+            let (tx_b, _rx_b) = tokio::sync::mpsc::channel(8);
+            let handle_b = ConnectionHandle::from_parts(
+                socket_b.clone(),
+                tx_b,
+                Arc::new(tokio::sync::Notify::new()),
+            );
+            ch.subscribe(socket_b.clone(), handle_b, Some(presence));
+
+            let ch_a = ch.clone();
+            let ch_b = ch.clone();
+            let t_a = std::thread::spawn(move || ch_a.unsubscribe(&socket_a));
+            let t_b = std::thread::spawn(move || ch_b.unsubscribe(&socket_b));
+
+            let outcome_a = t_a.join().expect("thread a must not panic");
+            let outcome_b = t_b.join().expect("thread b must not panic");
+
+            let removed_count = [&outcome_a.user_removed, &outcome_b.user_removed]
+                .into_iter()
+                .filter(|r| r.is_some())
+                .count();
+            assert_eq!(
+                removed_count, 1,
+                "iteration {iteration}: expected exactly one user_removed, got {removed_count}"
+            );
+        }
     }
 }

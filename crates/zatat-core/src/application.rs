@@ -51,6 +51,8 @@ pub struct Application {
     pub encryption_master_key: Option<String>,
     /// Cache-channel TTL. `None` keeps payloads forever.
     pub cache_ttl_seconds: Option<u64>,
+    pub max_presence_members_per_channel: u32,
+    pub max_presence_member_size_bytes: u32,
 }
 
 impl std::fmt::Debug for Application {
@@ -99,11 +101,19 @@ impl Application {
             emit_subscription_count: false,
             encryption_master_key: None,
             cache_ttl_seconds: None,
+            max_presence_members_per_channel: default_max_presence_members(),
+            max_presence_member_size_bytes: default_max_presence_member_size_bytes(),
         })
     }
 
     pub fn with_cache_ttl_seconds(mut self, ttl: Option<u64>) -> Self {
         self.cache_ttl_seconds = ttl;
+        self
+    }
+
+    pub fn with_presence_limits(mut self, max_members: u32, max_member_size_bytes: u32) -> Self {
+        self.max_presence_members_per_channel = max_members;
+        self.max_presence_member_size_bytes = max_member_size_bytes;
         self
     }
 
@@ -128,6 +138,14 @@ impl Application {
         }
         self.allowed_origins.is_match(host)
     }
+}
+
+fn default_max_presence_members() -> u32 {
+    100
+}
+
+fn default_max_presence_member_size_bytes() -> u32 {
+    2048
 }
 
 fn build_origin_globset(patterns: &[String]) -> Result<GlobSet, ApplicationError> {

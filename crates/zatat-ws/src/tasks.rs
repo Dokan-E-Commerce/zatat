@@ -11,7 +11,7 @@ use crate::state::ServerState;
 
 const PRESENCE_HEARTBEAT: Duration = Duration::from_secs(5);
 const PRESENCE_GC_INTERVAL: Duration = Duration::from_secs(5);
-const CONNECTION_MAINTENANCE: Duration = Duration::from_secs(60);
+const CONNECTION_MAINTENANCE: Duration = Duration::from_secs(15);
 
 pub async fn presence_snapshot_publisher(state: ServerState) {
     let mut tick = time::interval(PRESENCE_HEARTBEAT);
@@ -190,14 +190,13 @@ pub async fn presence_cache_gc(state: ServerState) {
     }
 }
 
-pub async fn connection_maintenance(_state: ServerState, tracker: ConnectionTracker) {
+pub async fn connection_maintenance(state: ServerState, tracker: ConnectionTracker) {
     let mut tick = time::interval(CONNECTION_MAINTENANCE);
     tick.tick().await;
 
     loop {
         tick.tick().await;
-        let snapshot = tracker.snapshot();
-        for entry in snapshot {
+        tracker.for_each(|entry| {
             if entry.is_stale() {
                 let _ = entry.handle.try_send(zatat_connection::Outbound::Close {
                     code: 4201,
@@ -207,13 +206,14 @@ pub async fn connection_maintenance(_state: ServerState, tracker: ConnectionTrac
                 let _ = entry.handle.try_send(zatat_connection::Outbound::Ping);
                 entry.conn.mark_pinged();
             }
-        }
+        });
+        state.channels.gc_empty_cache_channels();
     }
 }
 
 #[derive(Default, Clone)]
 pub struct ConnectionTracker {
-    inner: std::sync::Arc<parking_lot::RwLock<Vec<TrackedConnection>>>,
+    inner: std::sync::Arc<dashmap::DashMap<String, TrackedConnection>>,
 }
 
 #[derive(Clone)]
@@ -237,20 +237,21 @@ impl ConnectionTracker {
     }
 
     pub fn register(&self, tracked: TrackedConnection) {
-        self.inner.write().push(tracked);
+        self.inner
+            .insert(tracked.conn.socket_id.as_str().to_string(), tracked);
     }
 
     pub fn unregister(&self, socket_id: &zatat_core::id::SocketId) {
-        let mut w = self.inner.write();
-        w.retain(|t| t.conn.socket_id.as_str() != socket_id.as_str());
+        self.inner.remove(socket_id.as_str());
     }
 
-    pub fn snapshot(&self) -> Vec<TrackedConnection> {
-        let r = self.inner.read();
-        r.iter()
-            .filter(|t| !t.handle.is_closed())
-            .cloned()
-            .collect()
+    pub fn for_each(&self, mut f: impl FnMut(&TrackedConnection)) {
+        for t in self.inner.iter() {
+            if t.handle.is_closed() {
+                continue;
+            }
+            f(t.value());
+        }
     }
 }
 

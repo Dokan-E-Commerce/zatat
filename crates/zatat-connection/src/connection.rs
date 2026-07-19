@@ -8,6 +8,8 @@ use tokio::sync::{mpsc, Notify};
 use zatat_core::application::AppArc;
 use zatat_core::id::SocketId;
 
+const PONG_GRACE_SECONDS: i64 = 30;
+
 #[derive(Clone, Debug)]
 pub enum Outbound {
     /// Pre-serialized JSON frame, shared across recipients of a broadcast.
@@ -78,6 +80,7 @@ pub struct Connection {
     has_been_pinged: AtomicBool,
     user_id: Mutex<Option<String>>,
     watchlist: Mutex<Vec<String>>,
+    subscriptions: Mutex<std::collections::HashSet<String>>,
 }
 
 impl Connection {
@@ -90,6 +93,7 @@ impl Connection {
             has_been_pinged: AtomicBool::new(false),
             user_id: Mutex::new(None),
             watchlist: Mutex::new(Vec::new()),
+            subscriptions: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -112,11 +116,12 @@ impl Connection {
 
     pub fn is_inactive(&self) -> bool {
         let idle = now_seconds() - self.last_seen_at();
-        idle > self.app.activity_timeout as i64
+        idle > self.app.ping_interval as i64
     }
 
     pub fn is_stale(&self) -> bool {
-        self.has_been_pinged() && self.is_inactive()
+        let idle = now_seconds() - self.last_seen_at();
+        self.has_been_pinged() && idle > self.app.ping_interval as i64 + PONG_GRACE_SECONDS
     }
 
     pub fn bind_user(&self, user_id: String) {
@@ -138,6 +143,18 @@ impl Connection {
     pub fn watchlist(&self) -> Vec<String> {
         self.watchlist.lock().clone()
     }
+
+    pub fn add_subscription(&self, channel: &str) {
+        self.subscriptions.lock().insert(channel.to_string());
+    }
+
+    pub fn remove_subscription(&self, channel: &str) {
+        self.subscriptions.lock().remove(channel);
+    }
+
+    pub fn subscriptions_snapshot(&self) -> Vec<String> {
+        self.subscriptions.lock().iter().cloned().collect()
+    }
 }
 
 fn now_seconds() -> i64 {
@@ -145,4 +162,44 @@ fn now_seconds() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zatat_core::application::{AcceptClientEventsFrom, Application};
+    use zatat_core::id::{AppId, AppKey};
+
+    fn mk_app() -> AppArc {
+        Arc::new(
+            Application::new(
+                AppId::from("app"),
+                AppKey::from("key"),
+                "secret".into(),
+                30,
+                30,
+                10_000,
+                None,
+                AcceptClientEventsFrom::Members,
+                None,
+                vec!["*".into()],
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn subscriptions_snapshot_dedupes_and_removes() {
+        let conn = Connection::new(mk_app(), SocketId::generate(), None);
+
+        conn.add_subscription("private-foo");
+        conn.add_subscription("private-foo");
+        assert_eq!(
+            conn.subscriptions_snapshot(),
+            vec!["private-foo".to_string()]
+        );
+
+        conn.remove_subscription("private-foo");
+        assert!(conn.subscriptions_snapshot().is_empty());
+    }
 }

@@ -13,8 +13,6 @@ host = "0.0.0.0"
 port = 8080
 # Prefix every route with this path (e.g. "/realtime"). Empty = serve at root.
 path = ""
-# Optional hostname for logging and default scaling-channel names.
-hostname = "realtime.example.com"
 max_request_size = 10000
 
 # Webhook delivery queue behavior when the in-memory queue is full.
@@ -67,13 +65,24 @@ restart_poll_interval_seconds = 5
 id = "app-1"
 key = "app-key-1"
 secret = "app-secret-1"
+# Idle seconds before the server sends a pusher:ping; no pong within 30s
+# more and the socket is closed with 4201. Maintenance sweep runs every 15s.
 ping_interval = 30
+# Advertised to clients in connection_established. Doesn't drive server
+# behaviour itself — ping_interval is what actually triggers pings.
 activity_timeout = 30
 allowed_origins = ["*"]          # or ["app.example.com", "*.example.com"]
 max_message_size = 10000
 # max_connections = 10000        # omit for unlimited
 # Who's allowed to send client-* events: "all" | "members" | "none"
+# "all" is accepted but behaves like "members" — Pusher requires channel
+# membership for client events regardless, and a WARN is logged if you set
+# "all".
 accept_client_events_from = "members"
+
+# Presence channel caps.
+# max_presence_members_per_channel = 100   # new user_id rejected past this (pusher:error 4301)
+# max_presence_member_size_bytes   = 2048  # channel_data over this size is rejected (pusher:error 4301)
 
 # Optional: drop (or terminate) clients that exceed a sliding rate limit.
 # [apps.rate_limiting]

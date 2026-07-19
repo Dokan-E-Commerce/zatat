@@ -132,8 +132,12 @@ async fn ws_upgrade(
 
 fn url_host_or_self(raw: &str) -> &str {
     if let Some(rest) = raw.split_once("://").map(|(_, r)| r) {
-        let rest = rest.split('/').next().unwrap_or("");
-        rest.split(':').next().unwrap_or(rest)
+        let authority = rest.split('/').next().unwrap_or("");
+        if let Some(rest) = authority.strip_prefix('[') {
+            rest.split(']').next().unwrap_or(rest)
+        } else {
+            authority.split(':').next().unwrap_or(authority)
+        }
     } else {
         raw
     }
@@ -149,5 +153,7 @@ mod tests {
         assert_eq!(url_host_or_self("https://example.com:8443"), "example.com");
         assert_eq!(url_host_or_self("http://a.b.c:80/path"), "a.b.c");
         assert_eq!(url_host_or_self("example.com"), "example.com");
+        assert_eq!(url_host_or_self("https://[::1]:8443"), "::1");
+        assert_eq!(url_host_or_self("http://[2001:db8::1]/x"), "2001:db8::1");
     }
 }

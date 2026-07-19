@@ -37,3 +37,4 @@ bench/results
 # Local assistant / scratch files
 CLAUDE.md
 /.claude
+/terraform-mena

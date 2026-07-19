@@ -64,7 +64,8 @@ The name means "in a hurry" (زتات) in Bahraini Arabic. Seemed fitting.
   key / secret / rate limit / webhook targets / encryption key / origin
   allow-list.
 - **Scales out.** Enable Redis pub/sub for fan-out, cross-node presence
-  rosters, and fleet-wide `GET /channels` aggregation.
+  rosters, and fleet-wide `GET /channels` / `/channels/:channel` /
+  `/users` aggregation.
 - **Observable.** Prometheus `/metrics` with bearer-token auth for
   non-loopback binds; structured `tracing` logs (JSON or pretty).
 
@@ -90,9 +91,10 @@ The name means "in a hurry" (زتات) in Bahraini Arabic. Seemed fitting.
 | HTTP API: `events`, `batch_events`, `channels`, `channel`, `channel_users`, `users/:id/events`, `terminate_connections` | ✅ |
 | `info` echo on both `POST /events` and `POST /batch_events` | ✅ |
 | `info=cache` field on single-channel stats | ✅ |
-| Channel name cap 164 bytes, event name cap 200 bytes (Pusher spec) | ✅ |
-| Webhooks — 7 event types, HMAC-signed, backoff retry | ✅ |
-| Periodic ping-inactive + prune-stale with 4201 close | ✅ |
+| Channel name validated against Pusher charset, cap 164 bytes; event name cap 200 bytes | ✅ |
+| Presence channel caps — max members, max `channel_data` size (4301 over limit) | ✅ |
+| Webhooks — 7 event types, HMAC-signed, backoff retry (transient failures only) | ✅ |
+| Periodic ping-inactive + prune-stale with 4201 close (15 s sweep) | ✅ |
 | Graceful shutdown (`SIGTERM`/`SIGINT`) + restart-signal file | ✅ |
 | Origin allow-list with glob patterns | ✅ |
 | Per-app rate limiting (sliding window, optional connection terminate) | ✅ |
@@ -101,7 +103,7 @@ The name means "in a hurry" (زتات) in Bahraini Arabic. Seemed fitting.
 | Watchlist size cap 100 users (4302 over limit) | ✅ |
 | Redis pub/sub horizontal scaling | ✅ |
 | Cross-node presence with snapshot heartbeat + orphan GC | ✅ |
-| Cross-node `GET /channels` aggregation (merges stats from every node) | ✅ |
+| Cross-node aggregation for `GET /channels`, `/channels/:channel`, `/users` | ✅ |
 | Constant-time HMAC comparison everywhere | ✅ |
 | TLS (rustls) | ✅ |
 | Prometheus metrics with bearer-token auth | ✅ |
@@ -177,23 +179,34 @@ key    = "app-key-1"
 secret = "app-secret-1"
 
 # Keep-alive
-ping_interval      = 30       # seconds between pings
-activity_timeout   = 30       # idle before we ping / prune
+ping_interval      = 30       # idle seconds before the server sends pusher:ping;
+                              # no pong within 30s more and the socket is closed (4201)
+activity_timeout   = 30       # advertised to clients in connection_established —
+                              # doesn't drive server behaviour itself
 
 # Size limits
 max_message_size   = 10_000   # emit pusher:error 4200 on an oversized frame (connection stays open)
 max_connections    = 10_000   # reject with 4004 when reached
 
-# Origin allow-list — globs are supported
+# Origin allow-list — globs are supported. IPv6 origins are matched with
+# their brackets stripped, so a pattern of "::1" matches a browser Origin
+# of "http://[::1]:8080".
 allowed_origins    = ["app.example.com", "*.example.com", "localhost"]
 
 # Who can send client-* events: "all" | "members" | "none"
+# "all" is accepted but behaves like "members" — Pusher requires channel
+# membership for client events regardless, and a WARN is logged at
+# config load if you set "all".
 accept_client_events_from = "members"
 
 # Opt-in Pusher-parity features
 emit_subscription_count = true                             # fires pusher_internal:subscription_count on sub/unsub
 encryption_master_key   = "base64-32-bytes"                # enables server-side encryption for private-encrypted-*
 cache_ttl_seconds       = 1800                             # 0 = never expire
+
+# Presence channel caps
+max_presence_members_per_channel = 100    # new user_id rejected once a channel is at this size (pusher:error 4301)
+max_presence_member_size_bytes   = 2048   # channel_data over this size is rejected (pusher:error 4301)
 
 # Rate limiter: sliding window per connection
 [apps.rate_limiting]
@@ -216,7 +229,6 @@ filter_by_prefix = "presence-"
 host = "0.0.0.0"
 port = 8080
 path = "/realtime"          # nest all routes under this prefix (optional)
-hostname = "realtime.example.com"
 max_request_size = 10_000
 restart_signal_file = "/tmp/zatat.restart"
 restart_poll_interval_seconds = 5
@@ -262,8 +274,14 @@ backend's standard `/broadcasting/auth` (Laravel) or `/pusher/auth` (other
 frameworks) endpoint. zatat verifies the HMAC on the WS before completing
 the subscription.
 
-Channel-name cap: 164 bytes. Event-name cap: 200 bytes. Oversized get
-`pusher:error 4200`.
+Channel names are validated against Pusher's allowed charset —
+`A-Za-z0-9_-=@,.;` — and capped at 164 bytes; event names cap at 200
+bytes. A client `pusher:subscribe` for a name that fails either check is
+rejected with `pusher:error 4200` before any auth runs. That includes the
+internal `#server-to-user-<user_id>` namespace used for server-to-user
+events — clients can't subscribe to it directly. The HTTP events API is
+the one place `#server-to-user-<user_id>` is accepted as a channel name,
+since that's how the server publishes user-targeted events.
 
 ---
 
@@ -275,8 +293,11 @@ subscriber of that channel (excluding the sender).
 
 Gated by `accept_client_events_from` per app:
 
-- `"all"` — any signed-in socket may send
 - `"members"` — only subscribers of the target channel may send (default)
+- `"all"` — accepted for compatibility, but behaves exactly like
+  `"members"`: Pusher requires channel membership for client events no
+  matter what, so this setting can't actually widen who can send. A
+  `WARN` is logged at config load when it's set.
 - `"none"` — no whispers allowed; rejected with `pusher:error 4301`
 
 Additional guard: the rate limiter tracks total inbound frames per
@@ -334,8 +355,8 @@ All endpoints use HMAC-SHA256 request signing, verified in constant time.
 | `POST` | `/apps/:id/events` | Publish one event (supports `info` echo) |
 | `POST` | `/apps/:id/batch_events` | Publish up to 10 at once (per-event `info` echo) |
 | `GET` | `/apps/:id/channels` | List active channels (fleet-wide when scaling) |
-| `GET` | `/apps/:id/channels/:channel` | Inspect one channel (`info=occupied,subscription_count,user_count,cache`) |
-| `GET` | `/apps/:id/channels/:channel/users` | Members of a presence channel |
+| `GET` | `/apps/:id/channels/:channel` | Inspect one channel (`info=occupied,subscription_count,user_count,cache`; fleet-wide when scaling) |
+| `GET` | `/apps/:id/channels/:channel/users` | Members of a presence channel (fleet-wide when scaling) |
 | `POST` | `/apps/:id/users/:user_id/events` | Fan out to every socket signed in as this user |
 | `POST` | `/apps/:id/users/:user_id/terminate_connections` | Kick a user (also available as `DELETE /apps/:id/users/:user_id`) |
 | `GET` | `/health` | Liveness probe — returns `ok` |
@@ -344,6 +365,12 @@ Signature format: `HMAC-SHA256("{METHOD}\n{PATH}\n{sorted_params}", secret)`
 with `body_md5 = md5(body)` added when the body is non-empty, excluding
 `auth_signature`, `body_md5`, `appId`, `appKey`, and `channelName` from
 the sorted set. `server.path` is stripped from `PATH` before signing.
+
+`auth_timestamp` must be present and within 600 seconds of the server's
+clock in either direction — missing or stale, and the request is
+rejected with 401 before the signature is even checked. Every official
+`pusher-http-*` SDK sets this on every request, so it only bites
+hand-rolled signing code.
 
 ---
 
@@ -365,9 +392,15 @@ Event types emitted:
 | `cache_miss` | A subscriber hit an empty cache channel |
 | `subscription_count` | Subscription count on a channel changed |
 
-Delivery: async worker with 4-attempt exponential backoff, 10 s per
-request; filter per target with `event_types` + optional
+Delivery: async worker, up to 4 attempts total with exponential backoff
+between them (starts at 500 ms, doubles, capped at 10 s) and a 10 s
+timeout per request; filter per target with `event_types` + optional
 `filter_by_prefix`.
+
+Only transient failures are retried — `408`, `429`, any `5xx`, and
+network/transport errors. A permanent `4xx` response (400, 401, 404, …)
+is logged and not retried; retrying it would just repeat the same
+failure.
 
 **Delivery guarantees.** The in-process enqueue queue is bounded at 64k
 events to keep a stalled consumer from OOM'ing the server. Behavior when
@@ -404,6 +437,10 @@ Double-encryption is prevented — zatat checks `looks_encrypted(data)`
 before wrapping, so if the backend already sent a `{nonce, ciphertext}`
 object it's passed through untouched.
 
+Fails closed: if the app has no valid `encryption_master_key` configured,
+or encryption of the payload fails for any reason, the event is dropped
+— a `WARN` is logged, but it is never sent to subscribers as plaintext.
+
 ---
 
 ## Scaling with Redis
@@ -420,7 +457,7 @@ db   = 0
 ```
 
 Every node subscribes to the same Redis channel and rebroadcasts
-incoming payloads to its local subscribers. All five cross-node behaviours
+incoming payloads to its local subscribers. All six cross-node behaviours
 work:
 
 - **Event fan-out** — `POST /events` on node A reaches subscribers on
@@ -431,6 +468,11 @@ work:
 - **Cross-node `GET /channels`** — originator publishes a `MetricsRequest`
   on the bus, peers respond with their local channel lists, originator
   merges. 750 ms collection window, originator's own echo filtered out.
+- **Cross-node `GET /channels/:channel` and `GET .../users`** — these
+  don't do a live roundtrip. They read the same continuously-updated
+  peer caches used for presence (subscription counts and presence
+  rosters, refreshed on the same heartbeat/TTL as above) and merge them
+  with local state.
 - **Cross-node user events** — `POST /users/:id/events` reaches every
   socket of that user regardless of which node they're on.
 - **Auto-resubscribe** — fred's `manage_subscriptions` re-issues

@@ -13,7 +13,7 @@ use tracing::warn;
 use zatat_channels::{ChannelManager, ChannelStats};
 use zatat_config::Config;
 use zatat_core::application::AppArc;
-use zatat_core::channel_name::{MAX_CHANNEL_NAME_LEN, MAX_EVENT_NAME_LEN};
+use zatat_core::channel_name::{is_valid_channel_name, MAX_CHANNEL_NAME_LEN, MAX_EVENT_NAME_LEN};
 use zatat_core::id::{AppId, SocketId};
 use zatat_scaling::EventDispatcher;
 use zatat_webhooks::WebhookDispatcher;
@@ -290,6 +290,13 @@ fn validate_event_payload(ev: &EventPayload) -> Result<(), ApiError> {
                 format!("channel name exceeds {MAX_CHANNEL_NAME_LEN} bytes: {ch}"),
             ));
         }
+        if let Some(user_id) = ch.strip_prefix("#server-to-user-") {
+            if user_id.is_empty() {
+                return Err(ApiError(400, format!("invalid channel name: {ch}")));
+            }
+        } else if !is_valid_channel_name(&ch) {
+            return Err(ApiError(400, format!("invalid channel name: {ch}")));
+        }
     }
     Ok(())
 }
@@ -435,10 +442,50 @@ async fn channel_info(
         Some(s) if !s.is_empty() => format!("{},occupied,subscription_count", s),
         _ => "occupied,subscription_count".into(),
     };
-    let stats = match state.channels.channel_stats(&app.id, &channel) {
-        Some(s) => channel_stats_object(&s, Some(&info_plus_occupied)),
-        None => json!({ "occupied": false }),
+
+    let local = state.channels.channel_stats(&app.id, &channel);
+    let is_presence = zatat_core::channel_name::ChannelKind::from_name(&channel).is_presence();
+    let local_count = local.as_ref().map(|s| s.subscription_count).unwrap_or(0);
+    let has_cached_payload = local
+        .as_ref()
+        .map(|s| s.has_cached_payload)
+        .unwrap_or(false);
+
+    let (subscription_count, user_count, occupied) = if is_presence {
+        let mut user_ids = std::collections::BTreeSet::new();
+        if let Some(ch) = state.channels.find_channel(&app.id, &channel) {
+            for (_, _, presence) in ch.members_iter() {
+                if let Some(m) = presence {
+                    user_ids.insert(m.user_id);
+                }
+            }
+        }
+        let remote_members = state
+            .dispatcher
+            .presence_cache()
+            .remote_members_for(app.id.as_str(), &channel);
+        let has_remote_members = !remote_members.is_empty();
+        for m in remote_members {
+            user_ids.insert(m.user_id);
+        }
+        let occupied = local_count > 0 || has_remote_members;
+        (local_count, Some(user_ids.len()), occupied)
+    } else {
+        let peer_sum = state
+            .dispatcher
+            .peer_channel_counts()
+            .sum(app.id.as_str(), &channel);
+        let occupied = local_count > 0 || peer_sum > 0;
+        (local_count + peer_sum, None, occupied)
     };
+
+    let merged = zatat_channels::ChannelStats {
+        occupied,
+        subscription_count,
+        user_count,
+        has_cached_payload,
+    };
+    let stats = channel_stats_object(&merged, Some(&info_plus_occupied));
     Ok(Json(stats).into_response())
 }
 
@@ -457,17 +504,23 @@ async fn channel_users(
         &headers,
     )?;
 
-    let Some(ch) = state.channels.find_channel(&app.id, &channel_name) else {
-        return Err(ApiError(404, "channel not found".into()));
-    };
-    if !ch.kind().is_presence() {
+    if !zatat_core::channel_name::ChannelKind::from_name(&channel_name).is_presence() {
         return Err(ApiError(400, "not a presence channel".into()));
     }
     let mut seen = std::collections::BTreeSet::new();
-    for (_, _, presence) in ch.members_iter() {
-        if let Some(m) = presence {
-            seen.insert(m.user_id);
+    if let Some(ch) = state.channels.find_channel(&app.id, &channel_name) {
+        for (_, _, presence) in ch.members_iter() {
+            if let Some(m) = presence {
+                seen.insert(m.user_id);
+            }
         }
+    }
+    for m in state
+        .dispatcher
+        .presence_cache()
+        .remote_members_for(app.id.as_str(), &channel_name)
+    {
+        seen.insert(m.user_id);
     }
     let users: Vec<Value> = seen.into_iter().map(|id| json!({ "id": id })).collect();
     Ok(Json(json!({ "users": users })).into_response())
