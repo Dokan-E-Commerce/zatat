@@ -34,3 +34,6 @@ rustls-pemfile.workspace = true
 tokio-rustls.workspace = true
 serde_json.workspace = true
 metrics.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["process"] }

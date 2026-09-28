@@ -71,6 +71,17 @@ impl PresenceCache {
         inner.insert(node_id.to_string(), PeerSnapshot::new(members));
     }
 
+    /// Refresh a peer's liveness for this channel without changing its
+    /// roster (used when a stale snapshot is ignored).
+    pub fn touch(&self, app_id: &str, channel: &str, node_id: &str) {
+        let key = (app_id.to_string(), channel.to_string());
+        if let Some(entry) = self.peers.get(&key) {
+            if let Some(peer) = entry.write().get_mut(node_id) {
+                peer.touch();
+            }
+        }
+    }
+
     /// Add one user to the peer's live roster (live MemberAdded event).
     /// Returns true if the user was newly added to this peer's set.
     pub fn add_live(
@@ -135,6 +146,26 @@ impl PresenceCache {
         false
     }
 
+    /// Every user any peer entry still holds for the channel, including
+    /// entries past their TTL that GC has not reaped yet. Clients were told
+    /// about these users and have not been told they left: only GC announces
+    /// a peer's expiry.
+    pub fn announced_user_ids(
+        &self,
+        app_id: &str,
+        channel: &str,
+    ) -> std::collections::HashSet<String> {
+        let key = (app_id.to_string(), channel.to_string());
+        let Some(entry) = self.peers.get(&key) else {
+            return std::collections::HashSet::new();
+        };
+        let inner = entry.read();
+        inner
+            .values()
+            .flat_map(|peer| peer.members.keys().cloned())
+            .collect()
+    }
+
     pub fn remote_members_for(&self, app_id: &str, channel: &str) -> Vec<PresenceSnapshotMember> {
         let key = (app_id.to_string(), channel.to_string());
         let Some(entry) = self.peers.get(&key) else {
@@ -187,8 +218,22 @@ impl PresenceCache {
                     }
                 }
             }
+            let now_empty = inner.is_empty();
+            drop(inner);
+            drop(entry);
+            // Writers hold the map entry while inserting, so this cannot
+            // remove a channel another thread is adding a peer to.
+            if now_empty {
+                self.peers
+                    .remove_if(&key, |_, peers| peers.read().is_empty());
+            }
         }
         expired
+    }
+
+    #[cfg(test)]
+    pub(crate) fn channel_entries(&self) -> usize {
+        self.peers.len()
     }
 
     #[cfg(test)]
@@ -283,5 +328,14 @@ mod tests {
         let members = c.remote_members_for("a", "presence-x");
         let ids: Vec<_> = members.iter().map(|m| m.user_id.as_str()).collect();
         assert_eq!(ids, vec!["u3"]);
+    }
+
+    #[test]
+    fn gc_prunes_channels_with_no_peers_left() {
+        let c = PresenceCache::new();
+        c.insert_snapshot("a", "presence-x", "n1", vec![mk_member("u1")]);
+        c.backdate("a", "presence-x", "n1", 60);
+        assert_eq!(c.gc_expired().len(), 1);
+        assert_eq!(c.channel_entries(), 0);
     }
 }

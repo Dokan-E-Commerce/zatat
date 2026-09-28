@@ -6,7 +6,10 @@
 #
 #   ZATAT_SERVER__PORT=9090
 #   ZATAT_SERVER__SCALING__ENABLED=true
-#   ZATAT_APPS__0__SECRET=hunter2
+#   ZATAT_APPS__0__SECRET=hunter2   # one field of the first [[apps]] entry
+#
+# App overrides are re-applied on every apps reload, so they are never
+# replaced by this file's values.
 
 [server]
 host = "0.0.0.0"
@@ -17,9 +20,9 @@ max_request_size = 10000
 
 # Webhook delivery queue behavior when the in-memory queue is full.
 #   "best_effort" (default) — drop the event + count it; never blocks callers
-#   "block"                 — back-pressure: caller awaits a slot (zero loss)
-# Choose "block" when webhook delivery is a hard business dependency and
-# you've sized your consumer for the peak load.
+#   "block"                 — overflow into an ordered 64 MiB staging buffer,
+#                             then drop + count; callers still never wait
+# Neither mode is durable across a restart.
 # webhook_overflow_mode = "best_effort"
 
 # Sentinel file polled by the running server. Touching it triggers a graceful
@@ -47,7 +50,8 @@ restart_poll_interval_seconds = 5
 # channel = "zatat"
 # # How to react when the outbound publisher queue fills:
 # #   "best_effort" (default) — drop + count; hot paths never block
-# #   "block"                 — back-pressure callers; zero cross-node loss
+# #   "block"                 — overflow into an ordered 256 MiB staging
+# #                             buffer, then drop + count
 # overflow_mode = "best_effort"
 #
 # [server.scaling.redis]
@@ -74,6 +78,7 @@ activity_timeout = 30
 allowed_origins = ["*"]          # or ["app.example.com", "*.example.com"]
 max_message_size = 10000
 # max_connections = 10000        # omit for unlimited
+# max_channels_per_connection = 100   # further subscribes get pusher:error 4301
 # Who's allowed to send client-* events: "all" | "members" | "none"
 # "all" is accepted but behaves like "members" — Pusher requires channel
 # membership for client events regardless, and a WARN is logged if you set
@@ -81,7 +86,7 @@ max_message_size = 10000
 accept_client_events_from = "members"
 
 # Presence channel caps.
-# max_presence_members_per_channel = 100   # new user_id rejected past this (pusher:error 4301)
+# max_presence_members_per_channel = 100   # new user_id rejected past this, fleet-wide (pusher:error 4301)
 # max_presence_member_size_bytes   = 2048  # channel_data over this size is rejected (pusher:error 4301)
 
 # Optional: drop (or terminate) clients that exceed a sliding rate limit.

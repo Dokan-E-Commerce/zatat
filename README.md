@@ -2,20 +2,16 @@
 
 A Pusher-compatible WebSocket server, written in Rust.
 
-zatat speaks the [Pusher Channels protocol v7][pusher-protocol]. Any client
-or backend library that talks to Pusher or Laravel Reverb — pusher-js,
-Laravel Echo, `pusher-http-node`, `pusher-http-php`, `pusher-http-python`,
-`pusher-http-go`, `pusher-http-ruby`, the iOS / Android / Flutter SDKs, or a
-plain HTTP client — connects to zatat without code changes. Point it at
-`ws://host:8080/app/YOUR_KEY` and it just works.
+zatat implements the [Pusher Channels protocol v7][pusher-protocol] and
+the Pusher HTTP API for self-hosted WebSocket messaging, and is a drop-in
+replacement for Laravel Reverb. Point pusher-js / Laravel Echo at
+`ws://host:8080/app/YOUR_KEY` and your backend's Pusher SDK at the same
+host and port. Where zatat deliberately differs from hosted Pusher, the
+difference is listed under [Known limitations](#known-limitations).
 
-A client *library* version (e.g. `pusher-js` 8.5.0) is not the same as the
-Channels *protocol* version it speaks. zatat accepts protocol **5, 6, and
-7** at the WebSocket handshake and does not inspect the library version
-string the client sends, so **pusher-js 8.x — 8.5.0 included — and the
-matching Laravel Echo and mobile SDK releases are fully supported**: they
-all negotiate protocol 7. A client that requests any other protocol
-version is closed with `pusher:error 4007`.
+Client library versions and protocol versions are different. zatat accepts
+protocol **5, 6, and 7** and does not inspect the library version string,
+so pusher-js 8.x (protocol 7) connects like every other current SDK.
 
 The name means "in a hurry" (زتات) in Bahraini Arabic. Seemed fitting.
 
@@ -90,25 +86,27 @@ The name means "in a hurry" (زتات) in Bahraini Arabic. Seemed fitting.
 | Private-cache (`private-cache-*`) | ✅ |
 | Presence-cache (`presence-cache-*`) | ✅ |
 | Private-encrypted (`private-encrypted-*`) via NaCl Secretbox | ✅ |
-| Client events (`client-*`) with member-gating + rate limits | ✅ |
+| Private-encrypted-cache (`private-encrypted-cache-*`) | ✅ |
+| Client events (`client-*`) with member-gating + rate limits; `user_id` on presence channels; never cached | ✅ |
 | User authentication (`pusher:signin`) | ✅ |
 | Server-to-user events (`POST /apps/:id/users/:uid/events`) | ✅ |
 | Watchlist events (`pusher_internal:watchlist_events`) | ✅ |
 | Subscription count (`pusher_internal:subscription_count`), opt-in | ✅ |
 | Cache-miss frame (`pusher:cache_miss`) | ✅ |
-| HTTP API: `events`, `batch_events`, `channels`, `channel`, `channel_users`, `users/:id/events`, `terminate_connections` | ✅ |
-| `info` echo on both `POST /events` and `POST /batch_events` | ✅ |
-| `info=cache` field on single-channel stats | ✅ |
+| HTTP API: `events`, `batch_events`, `channels`, `channel`, `channel_users`, `users/:id/events`, `terminate_connections`, `connections` | ✅ |
+| `info` echo on both `POST /events` and `POST /batch_events` (fleet-wide) | ✅ |
+| `info=cache` (`{"data": …, "ttl": …}`) on channel stats | ✅ |
 | Channel name validated against Pusher charset, cap 164 bytes; event name cap 200 bytes | ✅ |
-| Presence channel caps — max members, max `channel_data` size (4301 over limit) | ✅ |
-| Webhooks — 7 event types, HMAC-signed, backoff retry (transient failures only) | ✅ |
+| Presence channel caps — max members (fleet-wide, atomic), max `channel_data` size (4301 over limit) | ✅ |
+| Per-connection channel cap, transport frame limit, bounded socket writes | ✅ |
+| Webhooks — 7 event types, HMAC-signed, fleet-aware occupied/vacated/member events, Pusher-style 5-minute retry | ✅ |
 | Periodic ping-inactive + prune-stale with 4201 close (15 s sweep) | ✅ |
-| Graceful shutdown (`SIGTERM`/`SIGINT`) + restart-signal file | ✅ |
+| Graceful shutdown (`SIGTERM`/`SIGINT` or restart-signal file): `/health` → 503, upgrades refused, bounded drain | ✅ |
 | Origin allow-list with glob patterns | ✅ |
 | Per-app rate limiting (sliding window, optional connection terminate) | ✅ |
 | `server.path` URL prefix (routes + signature strip) | ✅ |
 | Protocol version check at upgrade (4007 on unsupported) | ✅ |
-| Watchlist size cap 100 users (4302 over limit) | ✅ |
+| Watchlist size cap 100 users (first 100 kept, 4302 reported) | ✅ |
 | Redis pub/sub horizontal scaling | ✅ |
 | Cross-node presence with snapshot heartbeat + orphan GC | ✅ |
 | Cross-node aggregation for `GET /channels`, `/channels/:channel`, `/users` | ✅ |
@@ -131,13 +129,15 @@ cp zatat.toml.example zatat.toml
 ```
 
 zatat listens on `0.0.0.0:8080` by default. Check
-`http://127.0.0.1:8080/health` — it returns `ok`.
+`http://127.0.0.1:8080/health` — it returns `ok` (and `503 draining`
+once the server is shutting down). `/up` is an alias, as in Reverb.
 
 ### Docker
 
 ```sh
 docker build -t zatat .
-docker run -p 8080:8080 -v $(pwd)/zatat.toml:/etc/zatat/zatat.toml zatat
+docker run --ulimit nofile=65536:65536 -p 8080:8080 \
+  -v "$(pwd)/zatat.toml:/etc/zatat/zatat.toml:ro" zatat
 ```
 
 Image is based on `gcr.io/distroless/static-debian12:nonroot` — static
@@ -173,8 +173,16 @@ the `ZATAT_` prefix and `__` as the nesting separator:
 ```sh
 ZATAT_SERVER__PORT=9090
 ZATAT_SERVER__SCALING__ENABLED=true
-ZATAT_APPS__0__SECRET=hunter2
+ZATAT_APPS__0__SECRET=hunter2          # overrides one field of the first [[apps]] entry
+ZATAT_APPS__1__ID=app-2                # indexes past the file's apps add new apps
 ```
+
+`ZATAT_APPS__<index>__<FIELD>` overrides apply on startup *and* on every
+apps reload, so a secret supplied through the environment is never
+replaced by the file's value when `zatat.toml` changes. Values are read
+as TOML scalars (numbers, booleans, `[...]` arrays), except text settings
+such as ids, keys, secrets, hosts and passwords, which are used verbatim —
+`ZATAT_APPS__0__ID=123456` or an all-digit secret works as written.
 
 Full schema with every option in `zatat.toml.example`.
 
@@ -193,8 +201,10 @@ activity_timeout   = 30       # advertised to clients in connection_established 
                               # doesn't drive server behaviour itself
 
 # Size limits
-max_message_size   = 10_000   # emit pusher:error 4200 on an oversized frame (connection stays open)
+max_message_size   = 10_000   # emit pusher:error 4200 on an oversized frame (connection stays open);
+                              # frames over max(4 × this, 64 KiB) close the socket at the transport
 max_connections    = 10_000   # reject with 4004 when reached
+max_channels_per_connection = 100   # further subscribes are refused (pusher:error 4301)
 
 # Origin allow-list — globs are supported. IPv6 origins are matched with
 # their brackets stripped, so a pattern of "::1" matches a browser Origin
@@ -213,7 +223,8 @@ encryption_master_key   = "base64-32-bytes"                # enables server-side
 cache_ttl_seconds       = 1800                             # 0 = never expire
 
 # Presence channel caps
-max_presence_members_per_channel = 100    # new user_id rejected once a channel is at this size (pusher:error 4301)
+max_presence_members_per_channel = 100    # new user_id rejected once the channel has this many users
+                                          # across the fleet, as known to this node (pusher:error 4301)
 max_presence_member_size_bytes   = 2048   # channel_data over this size is rejected (pusher:error 4301)
 
 # Rate limiter: sliding window per connection
@@ -337,8 +348,9 @@ signed-in socket.
 
 ## Watchlist events
 
-On signin, a client can include a `watchlist: [user_ids]` array (max 100
-— over the cap yields a 4302 close). zatat then sends the client a
+On signin, a client can include a `watchlist: [user_ids]` array. As in
+Pusher, only the first 100 entries are watched: signin still succeeds and
+a `pusher:error` with code 4302 reports the truncation. zatat then sends the client a
 `pusher_internal:watchlist_events` frame whenever any of those users
 comes online or goes offline, following the standard Pusher shape:
 
@@ -361,18 +373,27 @@ All endpoints use HMAC-SHA256 request signing, verified in constant time.
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/apps/:id/events` | Publish one event (supports `info` echo) |
-| `POST` | `/apps/:id/batch_events` | Publish multiple events in one request, no per-batch cap (per-event `info` echo) |
-| `GET` | `/apps/:id/channels` | List active channels (fleet-wide when scaling) |
+| `POST` | `/apps/:id/batch_events` | Publish multiple events in one request, no per-batch cap (per-event `info` echo; `{}` without `info`) |
+| `GET` | `/apps/:id/channels` | List occupied channels as an object (fleet-wide when scaling; `user_count` needs `filter_by_prefix=presence-`) |
 | `GET` | `/apps/:id/channels/:channel` | Inspect one channel (`info=occupied,subscription_count,user_count,cache`; fleet-wide when scaling) |
 | `GET` | `/apps/:id/channels/:channel/users` | Members of a presence channel (fleet-wide when scaling) |
 | `POST` | `/apps/:id/users/:user_id/events` | Fan out to every socket signed in as this user |
 | `POST` | `/apps/:id/users/:user_id/terminate_connections` | Kick a user (also available as `DELETE /apps/:id/users/:user_id`) |
-| `GET` | `/health` | Liveness probe — returns `ok` |
+| `GET` | `/apps/:id/connections` | Live connection count (fleet-wide when scaling) |
+| `GET` | `/health`, `/up` | Readiness probe — `ok`, or `503` while draining |
+
+Each event may target at most 100 channels. An event for a
+`private-encrypted-*` channel whose data is plaintext is rejected with
+400 unless the app has an `encryption_master_key` to encrypt it; a
+rejected request publishes none of its events.
 
 Signature format: `HMAC-SHA256("{METHOD}\n{PATH}\n{sorted_params}", secret)`
 with `body_md5 = md5(body)` added when the body is non-empty, excluding
 `auth_signature`, `body_md5`, `appId`, `appKey`, and `channelName` from
-the sorted set. `server.path` is stripped from `PATH` before signing.
+the sorted set, parameter names lowercased. `server.path` is stripped
+from `PATH` before signing. A request whose `auth_key` names a different
+app, whose `auth_version` is not `1.0`, or whose declared `body_md5` does
+not match the body is rejected with 401.
 
 `auth_timestamp` must be present and within 600 seconds of the server's
 clock in either direction — missing or stale, and the request is
@@ -392,23 +413,20 @@ Event types emitted:
 
 | Event | When |
 |---|---|
-| `channel_occupied` | First subscriber joins |
-| `channel_vacated` | Last subscriber leaves |
-| `member_added` | New user joins a presence channel |
-| `member_removed` | Last socket for a user leaves a presence channel |
+| `channel_occupied` | First subscriber joins, fleet-wide |
+| `channel_vacated` | Last subscriber leaves, fleet-wide |
+| `member_added` | New user joins a presence channel, fleet-wide |
+| `member_removed` | A user's last socket leaves a presence channel, fleet-wide |
 | `client_event` | A `client-*` event was relayed |
-| `cache_miss` | A subscriber hit an empty cache channel |
+| `cache_miss` | A subscriber hit an empty cache channel (once per channel per empty period) |
 | `subscription_count` | Subscription count on a channel changed |
 
-Delivery: async worker, up to 4 attempts total with exponential backoff
-between them (starts at 500 ms, doubles, capped at 10 s) and a 10 s
-timeout per request; filter per target with `event_types` + optional
-`filter_by_prefix`.
-
-Only transient failures are retried — `408`, `429`, any `5xx`, and
-network/transport errors. A permanent `4xx` response (400, 401, 404, …)
-is logged and not retried; retrying it would just repeat the same
-failure.
+Delivery: async worker with a 10 s timeout per request; filter per
+target with `event_types` + optional `filter_by_prefix`. As with Pusher,
+any non-2xx response or transport error is retried with exponential
+backoff (1 s, doubling, capped at 60 s) for up to 5 minutes, then counted
+in `zatat_webhooks_failed_total`. At most 256 requests are in flight; a
+delivery waiting for its next retry does not hold one of those slots.
 
 **Delivery guarantees.** The in-process enqueue queue is bounded at 64k
 events to keep a stalled consumer from OOM'ing the server. Behavior when
@@ -417,10 +435,9 @@ it fills is controlled by `server.webhook_overflow_mode`:
 - `"best_effort"` (default) — new events are dropped and counted via
   `zatat_webhooks_dropped_total`. Alert on the counter. Producer hot paths
   never block.
-- `"block"` — producers are back-pressured until a slot frees up. Zero
-  loss; sustained overload slows the source of events instead of dropping
-  them. Also caps in-flight deliveries at 256 via an internal semaphore, so
-  a slow target never creates unbounded tokio tasks.
+- `"block"` — events overflow into an ordered staging buffer of up to
+  64 MiB before being dropped (and counted). Producers still never wait.
+  This rides out longer receiver outages; it is not durable.
 
 For durable-across-restart delivery, feed events from zatat into a real
 queue (Redis Streams, Kafka) and fan out from there.
@@ -556,8 +573,14 @@ zatat ping    [--config PATH]     # hits /health on the configured host:port
 ```
 
 `zatat restart` is the graceful-shutdown mechanism: the running server
-polls a sentinel file and drops cleanly when it sees a newer mtime. Have
-systemd / a container runtime bring it back up.
+polls a sentinel file and, when it sees a newer mtime, runs the same
+drain as `SIGTERM` and exits. Have systemd / a container runtime bring it
+back up.
+
+Shutdown sequence: `/health` starts answering `503` and new WebSocket
+upgrades are refused, every connection is closed with 1001, in-flight
+HTTP requests get up to 30 s to finish, and queued cross-node publishes
+and webhooks get up to 5 s to leave the process.
 
 ---
 
@@ -565,10 +588,21 @@ systemd / a container runtime bring it back up.
 
 ```sh
 docker build -t zatat .
-docker run --rm -p 8080:8080 \
-  -v $(pwd)/zatat.toml:/etc/zatat/zatat.toml \
+docker run --rm --ulimit nofile=65536:65536 -p 8080:8080 \
+  -v "$(pwd)/zatat.toml:/etc/zatat/zatat.toml:ro" \
   zatat
 ```
+
+Each WebSocket holds a file descriptor, and HTTP requests, Redis, logs
+and listeners need more. Docker commonly starts containers with a soft
+limit of 1,024, which fails HTTP accepts near 1,000 WebSockets. zatat
+raises its soft limit to the hard limit at startup and logs the result
+(`open-file limit`, with a warning below 16,384), so Docker's default hard
+limit of 524,288 is used automatically. Still set the limit explicitly
+where you control it: `--ulimit` for `docker run`, `ulimits` for Compose,
+`LimitNOFILE` for a service that runs zatat directly (a systemd unit that
+runs `docker run` does not pass its own `LimitNOFILE` to the container).
+Keep the connection limits across all apps below the effective limit.
 
 Docker Compose for a two-node Redis-scaled setup:
 
@@ -579,6 +613,8 @@ services:
     restart: unless-stopped
   zatat-a:
     build: .
+    ulimits:
+      nofile: {soft: 65536, hard: 65536}
     ports: ["8080:8080"]
     environment:
       ZATAT_SERVER__SCALING__ENABLED: "true"
@@ -586,6 +622,8 @@ services:
     volumes: [./zatat.toml:/etc/zatat/zatat.toml]
   zatat-b:
     build: .
+    ulimits:
+      nofile: {soft: 65536, hard: 65536}
     ports: ["8081:8080"]
     environment:
       ZATAT_SERVER__SCALING__ENABLED: "true"
@@ -597,8 +635,8 @@ services:
 
 ## Backends
 
-zatat is wire-compatible with the official Pusher server libraries — no
-drop-in adapter required, just change the host / port.
+The official Pusher server libraries work unchanged — point them at
+zatat's host and port.
 
 ### Node.js
 
@@ -811,9 +849,11 @@ live in `bench/README.md`.
   8.x — 8.5.0 included — connects on protocol 7 like every other current
   SDK.
 - Error codes emitted: **4001** (app doesn't exist), **4004** (over
-  quota), **4009** (unauthorized / bad origin), **4200** (invalid
-  message format), **4201** (stale prune), **4301** (rate limit /
-  client-events disabled / not a member), **4302** (watchlist > 100).
+  quota), **4009** (unauthorized / bad origin, including an origin
+  removed by a reload), **4200** (invalid message format), **4201**
+  (stale prune), **4301** (rate limit /
+  client-events disabled / not a member / channel caps), **4302**
+  (watchlist truncated to 100 — reported, not fatal).
 - Deliberately **not** emitted: **4003** (app disabled — no disabled
   state in self-hosted), **4100** (over capacity — zatat uses per-app
   `max_connections` → 4004 instead), **4202** (24-hour forced close —
@@ -830,38 +870,66 @@ live in `bench/README.md`.
 
 ## Production-readiness
 
-Honest take, because "production ready" depends on your scale:
+Resource limits: WebSocket frames are capped at the transport, every
+socket write has a 10 s deadline, every HTTP API request has a 10 s
+deadline, each connection may hold at most
+`max_channels_per_connection` subscriptions, cross-node and webhook
+queues are bounded in items and bytes, and presence caps are enforced
+per node against the fleet membership that node knows of (see Known
+limitations). Set `max_connections` and `rate_limiting` per app for
+public deployments.
 
-**Internal tools, < 10k concurrent, one or two nodes**: yes. Coverage is
-stronger than most comparable OSS and every known Reverb bug class is
-guarded by an explicit test.
+Operations: `/health` doubles as readiness (503 while draining). Alert on
+`zatat_scaling_publish_drops_total`, `zatat_scaling_publish_timeouts_total`,
+`zatat_redis_publish_failures_total`, `zatat_redis_connected == 0`,
+`zatat_webhooks_dropped_total`, `zatat_webhooks_failed_total` and
+`zatat_ws_write_timeouts_total`.
 
-**Customer-facing, 10k–100k concurrent, multi-node, revenue-adjacent**:
-most of the way there. Before shipping, run the hardening churn scripts
-in a loop for 24 h on a real Linux box watching RSS, actually build and
-run the Docker image in staging, canary behind a small LB weight first.
+App reloads: removing an app or changing its key closes that app's
+connections (4001); changing its allowed origins closes only connections
+from origins no longer allowed (4009). Every other change — including a
+rotated secret or encryption key — applies to existing connections from
+their next subscribe or sign-in, without disconnecting them.
 
-**SLA-bound / payment-critical**: not yet. CI (`.github/workflows/ci.yml`)
-runs fmt+clippy, `cargo test --workspace`, a Docker build/smoke-test, and
-a `fuzz-smoke` job on every push and PR, fuzzing `parse_inbound`,
-`verify_http`, `decrypt_payload`, and `presence_from_members`
-(`fuzz/fuzz_targets/`) for 30 s each. What's still missing: an **external
-security audit**, a **multi-week soak in a staging environment under
-replayed production traffic**, and a **verified 250 k-connection test on
-tuned Linux** (the design target, currently unrun).
+### Known limitations
 
----
+- Cross-node delivery uses Redis pub/sub: an event published while a
+  peer is disconnected from Redis is not replayed to that peer. There is
+  no durable outbox. Presence rosters, subscriber counts and online users
+  do heal: every node re-announces its state every 5 s, and clients are
+  sent the corrections.
+- Presence caps are enforced against this node's members plus the peer
+  state received over Redis. Joins on different nodes within Redis's
+  propagation delay (milliseconds normally; the whole outage if Redis is
+  down) can each take the last slot, so a channel can exceed
+  `max_presence_members_per_channel` — at worst by one cap's worth per
+  node. Members admitted that way stay until they leave; the cap only
+  stops further joins. It bounds resource use and is not a strict
+  fleet-wide quota.
+- Likewise two nodes acting in the same moment can both send
+  `channel_occupied` / `member_added`. `channel_vacated` and
+  `member_removed` are reconciled between the nodes involved (and reported
+  by a surviving node when a peer crashes), but can be lost if the
+  cross-node message itself is dropped. Webhook receivers should order
+  events by `time_ms`.
+- No HTTP/SockJS fallback transports — WebSocket only (the Echo/Reverb
+  default).
+- Pusher's per-event 10 KB data limit and 10-event batch limit are not
+  enforced; `server.max_request_size` bounds the request body instead.
+- zatat does not rate-limit connection attempts per IP address or time out
+  slow request headers; run it behind a load balancer or reverse proxy
+  that does (API requests themselves have a 10 s deadline, body included).
 
 ## Development
 
 ```sh
 cargo build --workspace
-cargo test --workspace                                      # unit + proptest, ~110 tests
+cargo test --workspace                                      # unit + proptest, ~140 tests
 cargo clippy --workspace --all-targets -- -D warnings       # lint
 cargo run --bin zatat -- start --config zatat.toml.example --debug
 ```
 
-The hardening E2E suite (46 scenarios, hundreds of individual checks)
+The hardening E2E suite (47 scenarios, hundreds of individual checks)
 lives under `tests/hardening/`:
 
 ```sh

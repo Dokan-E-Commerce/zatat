@@ -152,6 +152,14 @@ impl Connection {
         self.subscriptions.lock().remove(channel);
     }
 
+    pub fn is_subscribed(&self, channel: &str) -> bool {
+        self.subscriptions.lock().contains(channel)
+    }
+
+    pub fn subscription_count(&self) -> usize {
+        self.subscriptions.lock().len()
+    }
+
     pub fn subscriptions_snapshot(&self) -> Vec<String> {
         self.subscriptions.lock().iter().cloned().collect()
     }

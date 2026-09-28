@@ -8,7 +8,7 @@ use zatat_core::channel_name::ChannelName;
 use zatat_core::id::{AppId, SocketId};
 use zatat_protocol::presence::PresenceMember;
 
-use crate::channel::{Channel, UnsubscribeOutcome};
+use crate::channel::{Channel, SubscribeResult, UnsubscribeOutcome};
 
 #[derive(Debug)]
 pub enum ChannelManagerError {
@@ -42,6 +42,9 @@ pub struct AppChannels {
     pub channels: DashMap<String, Arc<Channel>>,
     pub user_index: DashMap<String, Vec<String>>, // user_id → Vec<socket_id>
     pub watchers: DashMap<String, HashSet<String>>, // watched_user_id → HashSet<watcher_user_id>
+    /// Per-user lock serializing a user's online/offline transitions with
+    /// the notifications they produce. Entries exist only while in use.
+    user_locks: DashMap<String, Arc<parking_lot::Mutex<()>>>,
 }
 
 #[derive(Default, Clone)]
@@ -96,6 +99,21 @@ impl ChannelManager {
         }
     }
 
+    /// Every live connection of `app_id` on this node.
+    pub fn connection_handles(&self, app_id: &AppId) -> Vec<ConnectionHandle> {
+        self.apps()
+            .get(app_id.as_str())
+            .map(|slot| slot.connections.iter().map(|e| e.value().clone()).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn channel_count(&self, app_id: &AppId) -> usize {
+        self.apps()
+            .get(app_id.as_str())
+            .map(|slot| slot.channels.len())
+            .unwrap_or(0)
+    }
+
     pub fn connection_count(&self, app_id: &AppId) -> usize {
         self.apps()
             .get(app_id.as_str())
@@ -121,33 +139,69 @@ impl ChannelManager {
         handle: ConnectionHandle,
         presence: Option<PresenceMember>,
     ) -> SubscribeOutcome {
+        self.subscribe_with(app, name, socket_id, handle, presence, |_| true, |_, _| {})
+            .expect("unconditional admission")
+    }
+
+    /// Subscribes `socket_id`, running `admit` before and `on_subscribed`
+    /// after the membership change while both the channel-map entry and the
+    /// channel's transition lock are held. `admit` returning `false` rejects
+    /// the subscription without changing any state (`None`).
+    ///
+    /// The closures receive the channel directly and must not call back into
+    /// this manager for the same app: the map shard is locked.
+    #[allow(clippy::too_many_arguments)]
+    pub fn subscribe_with(
+        &self,
+        app: &AppArc,
+        name: &ChannelName,
+        socket_id: SocketId,
+        handle: ConnectionHandle,
+        presence: Option<PresenceMember>,
+        admit: impl FnOnce(&Channel) -> bool,
+        on_subscribed: impl FnOnce(&Channel, &SubscribeResult),
+    ) -> Option<SubscribeOutcome> {
         let slot = self.app_slot(&app.id);
         let ttl = app.cache_ttl_seconds.map(std::time::Duration::from_secs);
         let name_owned = name.clone();
+        // Hold the map entry through subscription so an unsubscribe/GC
+        // cannot remove the channel while a new member is being attached.
         let channel = slot
             .channels
             .entry(name.as_str().to_string())
-            .or_insert_with(|| Arc::new(Channel::with_cache_ttl(name_owned, ttl)))
-            .clone();
-        let r = channel.subscribe(socket_id, handle, presence);
-        let presence_snapshot = if channel.kind().is_presence() {
-            channel.presence_snapshot()
-        } else {
-            None
+            .or_insert_with(|| Arc::new(Channel::with_cache_ttl(name_owned, ttl)));
+        let admitted = channel.with_transition(|| {
+            if !admit(&channel) {
+                return None;
+            }
+            let r = channel.subscribe(socket_id, handle, presence);
+            // Snapshot under the same lock: a concurrent joiner is then
+            // either in this roster or announced later via member_added.
+            let snapshot = channel.presence_snapshot();
+            on_subscribed(&channel, &r);
+            Some((r, snapshot))
+        });
+        let Some((r, presence_snapshot)) = admitted else {
+            // Don't leave behind a channel created only for a rejected join.
+            drop(channel);
+            slot.channels.remove_if(name.as_str(), |_, ch| {
+                ch.is_empty() && ch.cached_payload().is_none()
+            });
+            return None;
         };
         let cached_payload = if channel.kind().is_cache() {
             channel.cached_payload()
         } else {
             None
         };
-        SubscribeOutcome {
+        Some(SubscribeOutcome {
             was_new: r.was_new,
             user_added: r.user_added,
             member_count: r.member_count,
             presence_snapshot,
             cached_payload,
             kind: channel.kind(),
-        }
+        })
     }
 
     pub fn unsubscribe(
@@ -156,10 +210,29 @@ impl ChannelManager {
         channel_name: &str,
         socket_id: &SocketId,
     ) -> Option<UnsubscribeOutcome> {
+        self.unsubscribe_with(app_id, channel_name, socket_id, |_, _| {})
+    }
+
+    /// Unsubscribes `socket_id`, running `on_unsubscribed` under the
+    /// channel's transition lock so `member_removed` cannot overtake or
+    /// trail a concurrent `member_added` for the same channel.
+    pub fn unsubscribe_with(
+        &self,
+        app_id: &AppId,
+        channel_name: &str,
+        socket_id: &SocketId,
+        on_unsubscribed: impl FnOnce(&Channel, &UnsubscribeOutcome),
+    ) -> Option<UnsubscribeOutcome> {
         let slot = self.apps().get(app_id.as_str())?;
         let channel = slot.channels.get(channel_name)?.clone();
-        let outcome = channel.unsubscribe(socket_id);
-        slot.channels.remove_if(channel_name, |_, ch| ch.is_empty());
+        let outcome = channel.with_transition(|| {
+            let outcome = channel.unsubscribe(socket_id);
+            on_unsubscribed(&channel, &outcome);
+            outcome
+        });
+        slot.channels.remove_if(channel_name, |_, ch| {
+            ch.is_empty() && ch.cached_payload().is_none()
+        });
         Some(outcome)
     }
 
@@ -235,6 +308,36 @@ impl ChannelManager {
         self.find_channel(app_id, channel_name).map(|c| c.stats())
     }
 
+    /// Runs `f` while holding `user_id`'s transition lock. Signing in,
+    /// losing the last socket, and remote online/offline updates for one
+    /// user — together with the watchlist events and bus messages they
+    /// produce — must run inside it, so a reconnect cannot be announced
+    /// before the disconnect it follows. `f` must not re-enter this lock
+    /// for the same user.
+    pub fn with_user_transition<R>(
+        &self,
+        app_id: &AppId,
+        user_id: &str,
+        f: impl FnOnce() -> R,
+    ) -> R {
+        let slot = self.app_slot(app_id);
+        let lock = slot
+            .user_locks
+            .entry(user_id.to_string())
+            .or_default()
+            .clone();
+        let result = {
+            let _guard = lock.lock();
+            f()
+        };
+        drop(lock);
+        // Only the map holds it now (clones are made under the shard lock
+        // this takes), so nobody can be waiting on this mutex.
+        slot.user_locks
+            .remove_if(user_id, |_, l| Arc::strong_count(l) == 1);
+        result
+    }
+
     /// Idempotent — safe to call repeatedly for the same (user, socket).
     /// Returns `true` if this was the first local socket for `user_id`.
     pub fn bind_user(&self, app_id: &AppId, user_id: &str, socket_id: &SocketId) -> bool {
@@ -266,19 +369,16 @@ impl ChannelManager {
         let Some(slot) = self.apps().get(app_id.as_str()) else {
             return false;
         };
-        let mut was_last = false;
-        let mut remove_key = false;
-        if let Some(mut entry) = slot.user_index.get_mut(user_id) {
-            entry.retain(|s| s != socket_id.as_str());
-            if entry.is_empty() {
-                was_last = true;
-                remove_key = true;
+        if let dashmap::mapref::entry::Entry::Occupied(mut entry) =
+            slot.user_index.entry(user_id.to_string())
+        {
+            entry.get_mut().retain(|s| s != socket_id.as_str());
+            if entry.get().is_empty() {
+                entry.remove();
+                return true;
             }
         }
-        if remove_key {
-            slot.user_index.remove(user_id);
-        }
-        was_last
+        false
     }
 
     pub fn connections_for_user(&self, app_id: &AppId, user_id: &str) -> Vec<ConnectionHandle> {
@@ -320,19 +420,29 @@ impl ChannelManager {
             .unwrap_or_default()
     }
 
+    /// Drops `watcher_user_id` from every watch set, unless that user is
+    /// online again. The online check runs under each watch entry's lock, and
+    /// signin binds the user before adding watches, so a sign-in racing this
+    /// cleanup keeps its fresh watchlist.
     pub fn remove_all_watches_for(&self, app_id: &AppId, watcher_user_id: &str) {
         let Some(slot) = self.apps().get(app_id.as_str()) else {
             return;
         };
         let to_drop: Vec<String> = slot.watchers.iter().map(|e| e.key().clone()).collect();
         for watched in to_drop {
-            let mut empty = false;
-            if let Some(mut s) = slot.watchers.get_mut(&watched) {
-                s.remove(watcher_user_id);
-                empty = s.is_empty();
-            }
-            if empty {
-                slot.watchers.remove(&watched);
+            if let dashmap::mapref::entry::Entry::Occupied(mut entry) = slot.watchers.entry(watched)
+            {
+                let online = slot
+                    .user_index
+                    .get(watcher_user_id)
+                    .is_some_and(|sockets| !sockets.is_empty());
+                if online {
+                    return;
+                }
+                entry.get_mut().remove(watcher_user_id);
+                if entry.get().is_empty() {
+                    entry.remove();
+                }
             }
         }
     }
@@ -361,6 +471,62 @@ mod tests {
             .unwrap()
             .with_cache_ttl_seconds(cache_ttl_seconds),
         )
+    }
+
+    #[test]
+    fn last_unsubscribe_retains_live_cache_for_next_subscriber() {
+        let mgr = ChannelManager::new();
+        let app = mk_app(None);
+        let name = ChannelName::new("cache-news".to_string());
+        let sid = SocketId::generate();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let handle =
+            ConnectionHandle::from_parts(sid.clone(), tx, Arc::new(tokio::sync::Notify::new()));
+        mgr.subscribe(&app, &name, sid.clone(), handle.clone(), None);
+        let payload = Arc::<str>::from("cached event");
+        mgr.find_channel(&app.id, name.as_str())
+            .unwrap()
+            .set_cached_payload(payload.clone());
+        mgr.unsubscribe(&app.id, name.as_str(), &sid);
+        let result = mgr.subscribe(&app, &name, sid, handle, None);
+        assert_eq!(result.cached_payload, Some(payload));
+    }
+
+    #[test]
+    fn concurrent_channel_churn_keeps_surviving_subscriber_reachable() {
+        let mgr = ChannelManager::new();
+        let app = mk_app(None);
+        let name = ChannelName::new("churn".to_string());
+        for _ in 0..200 {
+            let old = SocketId::generate();
+            let new = SocketId::generate();
+            let (old_tx, _old_rx) = tokio::sync::mpsc::channel(8);
+            let (new_tx, _new_rx) = tokio::sync::mpsc::channel(8);
+            let old_handle = ConnectionHandle::from_parts(
+                old.clone(),
+                old_tx,
+                Arc::new(tokio::sync::Notify::new()),
+            );
+            let new_handle = ConnectionHandle::from_parts(
+                new.clone(),
+                new_tx,
+                Arc::new(tokio::sync::Notify::new()),
+            );
+            mgr.subscribe(&app, &name, old.clone(), old_handle, None);
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    mgr.unsubscribe(&app.id, name.as_str(), &old);
+                });
+                s.spawn(|| {
+                    mgr.subscribe(&app, &name, new.clone(), new_handle, None);
+                });
+            });
+            assert!(mgr
+                .find_channel(&app.id, name.as_str())
+                .unwrap()
+                .contains(new.as_str()));
+            mgr.unsubscribe(&app.id, name.as_str(), &new);
+        }
     }
 
     #[test]
@@ -474,5 +640,68 @@ mod tests {
                 "iteration {iteration}: Ok registrations ({ok_count}) must equal the final connection_count ({count})"
             );
         }
+    }
+
+    /// The admission check and the insert happen under one lock, so racing
+    /// joiners cannot push a capped presence channel past its limit.
+    #[test]
+    fn concurrent_capped_presence_joins_never_exceed_cap() {
+        let mgr = ChannelManager::new();
+        let app = mk_app(None);
+        let name = ChannelName::new("presence-capped".to_string());
+        let cap = 5;
+        for _ in 0..50 {
+            std::thread::scope(|s| {
+                for i in 0..16 {
+                    let mgr = &mgr;
+                    let app = &app;
+                    let name = &name;
+                    s.spawn(move || {
+                        let sid = SocketId::generate();
+                        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+                        let handle = ConnectionHandle::from_parts(
+                            sid.clone(),
+                            tx,
+                            Arc::new(tokio::sync::Notify::new()),
+                        );
+                        let member = PresenceMember {
+                            user_id: format!("user-{i}"),
+                            user_info: None,
+                        };
+                        let _ = mgr.subscribe_with(
+                            app,
+                            name,
+                            sid,
+                            handle,
+                            Some(member),
+                            |ch| ch.user_count() < cap,
+                            |_, _| {},
+                        );
+                    });
+                }
+            });
+            let ch = mgr.find_channel(&app.id, name.as_str()).unwrap();
+            assert_eq!(ch.user_count(), cap);
+            for (sid, _, _) in ch.members_iter() {
+                mgr.unsubscribe(&app.id, name.as_str(), &SocketId::from_string(sid));
+            }
+        }
+    }
+
+    /// A watcher who signs in again before cleanup finishes keeps the
+    /// watches of the new session.
+    #[test]
+    fn remove_all_watches_skips_a_user_who_is_online_again() {
+        let mgr = ChannelManager::new();
+        let app_id = AppId::from("app-1");
+        mgr.add_watcher(&app_id, "bob", "alice");
+        mgr.bind_user(&app_id, "alice", &SocketId::generate());
+        mgr.remove_all_watches_for(&app_id, "alice");
+        assert_eq!(mgr.watchers_of(&app_id, "bob"), vec!["alice".to_string()]);
+
+        let mgr = ChannelManager::new();
+        mgr.add_watcher(&app_id, "bob", "alice");
+        mgr.remove_all_watches_for(&app_id, "alice");
+        assert!(mgr.watchers_of(&app_id, "bob").is_empty());
     }
 }

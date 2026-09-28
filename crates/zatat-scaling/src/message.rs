@@ -6,10 +6,20 @@ use serde_json::Value;
 pub const SCALING_VERSION: u8 = 2;
 pub const SNAPSHOT_TTL: Duration = Duration::from_secs(15);
 
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScalingEnvelope {
     #[serde(rename = "v")]
     pub version: u8,
+    /// Per-origin-node sequence number, increasing in publish order. A
+    /// snapshot carries the sequence current when it was captured, so a
+    /// receiver can tell it predates a live update it already applied.
+    /// 0 (older peers) means "unknown": always applied.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub seq: u64,
     pub app: AppRef,
     #[serde(flatten)]
     pub payload: ScalingPayload,
@@ -48,6 +58,9 @@ pub enum ScalingPayload {
         event: String,
         data: String,
         socket_id: String,
+        /// Sender's user id on presence channels; absent from older peers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_id: Option<String>,
     },
     PresenceSnapshot {
         node_id: String,
@@ -70,6 +83,9 @@ pub enum ScalingPayload {
         request_id: String,
         node_id: String,
         channels: Vec<ChannelMetric>,
+        /// Responder's live connection count for the app (0 from older peers).
+        #[serde(default)]
+        connections: usize,
     },
     /// A presence `user_id` newly appeared on the origin node.
     /// Receivers dedupe against local + other-peer caches and only emit
@@ -89,6 +105,14 @@ pub enum ScalingPayload {
         origin_node_id: String,
         channel: String,
         user_id: String,
+        /// The origin withheld its `member_removed` webhook because the user
+        /// still looked present on a peer. Absent from older peers.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        webhook_withheld: bool,
+        /// Same for `channel_vacated`: the origin's last local subscriber
+        /// left but a peer still looked occupied.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        vacated_withheld: bool,
     },
     /// A non-presence channel's subscription count changed on the origin
     /// node. Receivers update their per-peer count tracker and emit
@@ -97,6 +121,9 @@ pub enum ScalingPayload {
         origin_node_id: String,
         channel: String,
         count: usize,
+        /// See `MemberRemoved::vacated_withheld`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        vacated_withheld: bool,
     },
     /// A user's first socket on the origin node came online.
     /// Receivers dedupe against other-peer caches + local state and emit a
@@ -137,6 +164,9 @@ pub struct MetricsQuery {
     pub filter_by_prefix: Option<String>,
     #[serde(default)]
     pub info: Option<String>,
+    /// Only the connection count is wanted; responders skip the channel list.
+    #[serde(default)]
+    pub connections_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,6 +202,7 @@ mod tests {
     fn round_trip_message_payload() {
         let env = ScalingEnvelope {
             version: SCALING_VERSION,
+            seq: 0,
             app: AppRef {
                 id: "a".into(),
                 key: "k".into(),
@@ -193,6 +224,7 @@ mod tests {
     fn round_trip_terminate() {
         let env = ScalingEnvelope {
             version: SCALING_VERSION,
+            seq: 0,
             app: AppRef {
                 id: "a".into(),
                 key: "k".into(),
@@ -210,6 +242,7 @@ mod tests {
     fn round_trip_presence_snapshot() {
         let env = ScalingEnvelope {
             version: SCALING_VERSION,
+            seq: 0,
             app: AppRef {
                 id: "a".into(),
                 key: "k".into(),
@@ -256,10 +289,13 @@ mod tests {
                 origin_node_id: "n1".into(),
                 channel: "presence-x".into(),
                 user_id: "u".into(),
+                webhook_withheld: true,
+                vacated_withheld: false,
             },
         ] {
             let env = ScalingEnvelope {
                 version: SCALING_VERSION,
+                seq: 0,
                 app: AppRef {
                     id: "a".into(),
                     key: "k".into(),
@@ -278,6 +314,7 @@ mod tests {
                 origin_node_id: "n1".into(),
                 channel: "room".into(),
                 count: 17,
+                vacated_withheld: false,
             },
             ScalingPayload::UserOnline {
                 origin_node_id: "n1".into(),
@@ -301,6 +338,7 @@ mod tests {
         ] {
             let env = ScalingEnvelope {
                 version: SCALING_VERSION,
+                seq: 0,
                 app: AppRef {
                     id: "a".into(),
                     key: "k".into(),

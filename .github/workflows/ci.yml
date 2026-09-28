@@ -60,7 +60,7 @@ jobs:
       - run: docker build -t zatat:ci .
       - name: Smoke-test the image
         run: |
-          docker run --rm -d --name zatat-smoke -p 18080:8080 \
+          docker run --rm -d --name zatat-smoke --ulimit nofile=65536:65536 -p 18080:8080 \
             -v "$PWD/zatat.toml.example":/etc/zatat/zatat.toml \
             zatat:ci
           ok=0

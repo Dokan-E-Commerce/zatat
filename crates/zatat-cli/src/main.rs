@@ -111,8 +111,44 @@ fn init_tracing(debug: bool) {
     }
 }
 
+/// Every WebSocket holds a file descriptor. Containers commonly start with a
+/// soft limit of 1024 (Docker ≥ 25 no longer raises it), which caps a node
+/// near 1,000 connections and then fails HTTP accepts too. Raise the soft
+/// limit to the hard limit, as Go runtimes do, and log the result.
+#[cfg(unix)]
+fn raise_fd_limit() {
+    use rustix::process::{getrlimit, setrlimit, Resource};
+    const WARN_BELOW: u64 = 16_384;
+    // Hard limit "unlimited" (macOS reports this) still has a kernel cap;
+    // ask for a large finite value and fall back if refused.
+    const UNLIMITED_TARGET: u64 = 1 << 20;
+    let mut limit = getrlimit(Resource::Nofile);
+    let before = limit.current;
+    let target = limit.maximum.unwrap_or(UNLIMITED_TARGET);
+    if before.is_some_and(|soft| soft < target) {
+        limit.current = Some(target);
+        if setrlimit(Resource::Nofile, limit).is_err() && limit.maximum.is_none() {
+            limit.current = Some(10_240);
+            let _ = setrlimit(Resource::Nofile, limit);
+        }
+    }
+    let after = getrlimit(Resource::Nofile).current;
+    match after {
+        Some(n) if n < WARN_BELOW => warn!(
+            open_files_limit = n,
+            "open-file limit is low; each WebSocket needs one — raise the hard limit \
+             (docker --ulimit nofile=65536:65536, systemd LimitNOFILE)"
+        ),
+        _ => info!(open_files_limit = ?after, previous = ?before, "open-file limit"),
+    }
+}
+
+#[cfg(not(unix))]
+fn raise_fd_limit() {}
+
 async fn start(config_path: &Path, debug: bool) -> Result<()> {
     init_tracing(debug);
+    raise_fd_limit();
     let config =
         Config::load(config_path).with_context(|| format!("loading {}", config_path.display()))?;
 
@@ -141,6 +177,11 @@ async fn start(config_path: &Path, debug: bool) -> Result<()> {
 
     let state: ServerState =
         ServerStateInner::with_provider(config.clone(), provider.clone(), scaling_enabled);
+    if metrics_handle.is_some() {
+        for app_id in config.apps().by_id.keys() {
+            zatat_metrics::register_app(app_id.as_str());
+        }
+    }
 
     if scaling_enabled {
         let dispatcher = state.dispatcher.clone();
@@ -213,12 +254,12 @@ async fn start(config_path: &Path, debug: bool) -> Result<()> {
     supervise("connection_maintenance", move || {
         zatat_ws::tasks::connection_maintenance(maint_state.clone(), tracker.clone())
     });
-    // Watch zatat.toml; swap the [[apps]] table on mtime change.
-    // Live WS connections keep their captured AppArc and are unaffected.
-    let config_watch = config.clone();
+    // Watch zatat.toml; swap the [[apps]] table on mtime change and close
+    // connections the new table no longer authorizes.
+    let watch_state = state.clone();
     let config_watch_path = config_path.to_path_buf();
     supervise("watch_config_apps", move || {
-        watch_config_apps(config_watch.clone(), config_watch_path.clone())
+        watch_config_apps(watch_state.clone(), config_watch_path.clone())
     });
 
     // When `server.path` is set, WS + REST routes live under that prefix;
@@ -236,38 +277,40 @@ async fn start(config_path: &Path, debug: bool) -> Result<()> {
         base_router
     } else {
         axum::Router::new()
-            .route("/health", axum::routing::get(|| async { "ok" }))
+            .route("/health", axum::routing::get(zatat_ws::router::health))
+            .route("/up", axum::routing::get(zatat_ws::router::health))
+            .with_state(state.clone())
             .nest(&prefix, base_router)
     };
 
     if let Some(handle) = metrics_handle.clone() {
         let listen = handle.listen_addr();
-        tokio::spawn(async move {
-            let router: Router = Router::new().route(
-                "/metrics",
-                get({
-                    let h = handle.clone();
-                    move |headers: axum::http::HeaderMap| {
-                        let h = h.clone();
-                        async move {
-                            let auth = headers.get("authorization").and_then(|v| v.to_str().ok());
-                            if !h.authorize(auth) {
-                                return (axum::http::StatusCode::UNAUTHORIZED, String::new());
-                            }
-                            (axum::http::StatusCode::OK, h.render())
+        // Bind before serving traffic: a node that cannot expose metrics
+        // must fail to start rather than run unobserved.
+        let listener = tokio::net::TcpListener::bind(listen)
+            .await
+            .with_context(|| format!("binding metrics listener on {listen}"))?;
+        let router: Router = Router::new().route(
+            "/metrics",
+            get({
+                let h = handle.clone();
+                move |headers: axum::http::HeaderMap| {
+                    let h = h.clone();
+                    async move {
+                        let auth = headers.get("authorization").and_then(|v| v.to_str().ok());
+                        if !h.authorize(auth) {
+                            return (axum::http::StatusCode::UNAUTHORIZED, String::new());
                         }
+                        (axum::http::StatusCode::OK, h.render())
                     }
-                }),
-            );
-            info!(%listen, "metrics listener up");
-            let listener = match tokio::net::TcpListener::bind(listen).await {
-                Ok(l) => l,
-                Err(err) => {
-                    warn!(%err, "failed to bind metrics listener");
-                    return;
                 }
-            };
-            let _ = axum::serve(listener, router).await;
+            }),
+        );
+        info!(%listen, "metrics listener up");
+        tokio::spawn(async move {
+            if let Err(err) = axum::serve(listener, router).await {
+                warn!(%err, "metrics listener stopped");
+            }
         });
     }
 
@@ -277,15 +320,16 @@ async fn start(config_path: &Path, debug: bool) -> Result<()> {
     info!(%listen_addr, "zatat listening");
 
     // Graceful shutdown contract (critical for zero-downtime deploys):
-    //   1. SIGTERM / SIGINT received.
-    //   2. state.shutdown_now() — broadcast pusher_close(1001) to every
-    //      live WS connection so clients see a clean close and reconnect.
+    //   1. SIGTERM / SIGINT received, or the restart file was touched.
+    //   2. state.shutdown_now() — enter draining: /health answers 503 so the
+    //      LB stops routing here, new upgrades are refused, and every live
+    //      WS connection gets pusher_close(1001) so clients reconnect.
     //   3. Short pause (2s) so those close frames physically leave the
     //      TCP buffer before we stop accepting writes.
     //   4. Ask the HTTP listener to drain — it stops accepting new
     //      connections but WAITS for in-flight request handlers (e.g.
     //      Laravel POST /events) to return their responses. Up to 30s.
-    //   5. Serve future returns cleanly.
+    //   5. Flush the cross-node publish queue and webhook queue, bounded.
     //
     // The previous `tokio::select!` pattern bypassed step 4 — when ctrl_c
     // fired, the serve future was dropped mid-flight and any in-flight
@@ -294,6 +338,22 @@ async fn start(config_path: &Path, debug: bool) -> Result<()> {
     // a single bad rolling deploy on prod, 2026-04-18).
     const GRACEFUL_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
     const WS_CLOSE_FLUSH_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+    const OUTBOUND_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    // Resolves once shutdown was requested by a signal or the restart file,
+    // after draining has begun and close frames had time to flush.
+    let begin_shutdown = {
+        let state = state.clone();
+        async move {
+            tokio::select! {
+                _ = shutdown_signal() => info!("[shutdown] signal received"),
+                _ = state.draining() => info!("[shutdown] restart requested"),
+            }
+            info!("[shutdown] draining — closing WS connections with 1001");
+            state.shutdown_now();
+            tokio::time::sleep(WS_CLOSE_FLUSH_DELAY).await;
+        }
+    };
 
     if let Some(tls) = &config.server.tls {
         // rustls 0.23 needs an explicit crypto provider. idempotent if already set.
@@ -308,13 +368,9 @@ async fn start(config_path: &Path, debug: bool) -> Result<()> {
             tls.key.clone(),
         ));
         let handle = axum_server::Handle::new();
-        let shutdown_state = state.clone();
         let handle_for_shutdown = handle.clone();
         tokio::spawn(async move {
-            shutdown_signal().await;
-            info!("[shutdown] signal received — closing WS connections with 1001");
-            shutdown_state.shutdown_now();
-            tokio::time::sleep(WS_CLOSE_FLUSH_DELAY).await;
+            begin_shutdown.await;
             info!(
                 timeout_s = GRACEFUL_HTTP_TIMEOUT.as_secs(),
                 "[shutdown] asking HTTP listener to drain in-flight requests"
@@ -330,36 +386,73 @@ async fn start(config_path: &Path, debug: bool) -> Result<()> {
         let listener = tokio::net::TcpListener::bind(listen_addr)
             .await
             .context("bind")?;
-        let shutdown_state = state.clone();
-        axum::serve(
+        let (drain_started_tx, drain_started_rx) = tokio::sync::oneshot::channel::<()>();
+        let serve = axum::serve(
             listener,
             app_router.into_make_service_with_connect_info::<SocketAddr>(),
         )
         .with_graceful_shutdown(async move {
-            shutdown_signal().await;
-            info!("[shutdown] signal received — closing WS connections with 1001");
-            shutdown_state.shutdown_now();
-            tokio::time::sleep(WS_CLOSE_FLUSH_DELAY).await;
-            info!("[shutdown] HTTP listener draining in-flight requests");
-            // axum::serve's graceful_shutdown future completes here → axum
-            // stops accepting new connections, then waits for in-flight to
-            // finish. No explicit timeout API on axum::serve, so we rely on
-            // request handlers being bounded (our routes are all short).
-        })
-        .await
-        .context("serve")?;
+            begin_shutdown.await;
+            info!(
+                timeout_s = GRACEFUL_HTTP_TIMEOUT.as_secs(),
+                "[shutdown] HTTP listener draining in-flight requests"
+            );
+            let _ = drain_started_tx.send(());
+        });
+        // axum::serve has no drain timeout of its own; bound it here so a
+        // stuck request cannot hold the process past the deploy's grace.
+        let drain_deadline = async move {
+            if drain_started_rx.await.is_ok() {
+                tokio::time::sleep(GRACEFUL_HTTP_TIMEOUT).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::select! {
+            result = serve => result.context("serve")?,
+            _ = drain_deadline => {
+                warn!(
+                    timeout_s = GRACEFUL_HTTP_TIMEOUT.as_secs(),
+                    "[shutdown] HTTP drain timed out; dropping remaining requests"
+                );
+            }
+        }
     }
 
+    drain_outbound(&state, OUTBOUND_DRAIN_TIMEOUT).await;
     info!("shutdown complete");
     Ok(())
 }
 
+/// Waits (bounded) for queued cross-node publishes and webhook deliveries
+/// to leave the process, so events accepted just before shutdown are not
+/// silently lost with the runtime.
+async fn drain_outbound(state: &ServerState, timeout: std::time::Duration) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let publishes = state.dispatcher.pending_publishes();
+        let webhooks = state.webhooks.pending();
+        if publishes == 0 && webhooks == 0 {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            warn!(
+                publishes,
+                webhooks, "[shutdown] outbound queues not empty at deadline; exiting anyway"
+            );
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 /// Polls zatat.toml for mtime changes every N seconds (default 5,
-/// override via `ZATAT_APPS_RELOAD_INTERVAL_S`). On change, re-parses
-/// the file and atomically swaps the apps table. Existing WS
-/// connections keep the `AppArc` they captured at upgrade time, so
-/// they observe the apps config they connected with — no disconnect.
-async fn watch_config_apps(config: Config, path: PathBuf) {
+/// override via `ZATAT_APPS_RELOAD_INTERVAL_S`). On change, re-reads the
+/// file plus `ZATAT_*` overrides and atomically swaps the apps table.
+/// Existing connections use the new settings for later actions; a removed
+/// or re-keyed app's connections, and connections from origins the app no
+/// longer allows, are closed.
+async fn watch_config_apps(state: ServerState, path: PathBuf) {
     let interval_s = std::env::var("ZATAT_APPS_RELOAD_INTERVAL_S")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
@@ -373,14 +466,19 @@ async fn watch_config_apps(config: Config, path: PathBuf) {
             continue;
         };
         let Ok(mtime) = meta.modified() else { continue };
-        if mtime > last {
-            match config.reload_apps_from(&path) {
-                Ok(n) => {
-                    last = mtime;
-                    info!(apps = n, file = %path.display(), "apps config reloaded");
+        if mtime <= last {
+            continue;
+        }
+        match state.config.reload_apps_from(&path) {
+            Ok(reload) => {
+                last = mtime;
+                info!(apps = reload.loaded, revoked = reload.revoked.len(), file = %path.display(), "apps config reloaded");
+                for app_id in state.config.apps().by_id.keys() {
+                    zatat_metrics::register_app(app_id.as_str());
                 }
-                Err(err) => warn!(%err, "apps reload failed; keeping previous apps"),
+                zatat_ws::tasks::apply_apps_reload(&state, &reload);
             }
+            Err(err) => warn!(%err, "apps reload failed; keeping previous apps"),
         }
     }
 }

@@ -48,6 +48,24 @@ pub fn encode_envelope_raw_data(
     buf
 }
 
+/// A relayed `client-*` event. On presence channels Pusher adds the
+/// sender's authenticated `user_id` so recipients know who whispered.
+pub fn encode_client_event(
+    event: &str,
+    data_raw: &str,
+    channel: &str,
+    user_id: Option<&str>,
+) -> String {
+    let mut buf = encode_envelope_raw_data(event, Some(data_raw), Some(channel));
+    if let Some(user_id) = user_id {
+        buf.pop();
+        buf.push_str(",\"user_id\":");
+        write_json_string(&mut buf, user_id);
+        buf.push('}');
+    }
+    buf
+}
+
 fn write_json_string(buf: &mut String, s: &str) {
     buf.push('"');
     for c in s.chars() {
@@ -99,6 +117,17 @@ mod tests {
         let s = encode_envelope("pusher:cache_miss", None, Some("cache-x"));
         assert!(!s.contains("data"));
         assert!(s.contains(r#""channel":"cache-x""#));
+    }
+
+    #[test]
+    fn client_event_carries_user_id_only_when_given() {
+        let with = encode_client_event("client-typing", "{}", "presence-room", Some("7\"x"));
+        let v: Value = serde_json::from_str(&with).unwrap();
+        assert_eq!(v["user_id"], "7\"x");
+        assert_eq!(v["channel"], "presence-room");
+        let without = encode_client_event("client-typing", "{}", "private-room", None);
+        let v: Value = serde_json::from_str(&without).unwrap();
+        assert!(v.get("user_id").is_none());
     }
 
     #[test]

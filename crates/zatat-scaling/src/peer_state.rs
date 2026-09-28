@@ -98,8 +98,55 @@ impl PeerChannelCounts {
                     out.push((key.0.clone(), key.1.clone(), node, e.count));
                 }
             }
+            let now_empty = inner.is_empty();
+            drop(inner);
+            drop(entry);
+            if now_empty {
+                self.inner
+                    .remove_if(&key, |_, peers| peers.read().is_empty());
+            }
         }
         out
+    }
+
+    /// Refresh a peer's liveness for `channel` without changing its count.
+    pub fn touch(&self, app_id: &str, channel: &str, node_id: &str) {
+        let key = (app_id.to_string(), channel.to_string());
+        if let Some(entry) = self.inner.get(&key) {
+            if let Some(e) = entry.write().get_mut(node_id) {
+                e.inserted_at = Instant::now();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn channel_entries(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Drops `node_id`'s count for every channel of `app_id` not in
+    /// `present` and returns those channels — a snapshot lists only channels the peer still holds, so
+    /// anything it omits is empty there (e.g. its count-0 update was lost).
+    pub fn retain_node_channels(
+        &self,
+        app_id: &str,
+        node_id: &str,
+        present: &std::collections::HashSet<&str>,
+        mut may_drop: impl FnMut(&str) -> bool,
+    ) -> Vec<String> {
+        let mut dropped = Vec::new();
+        for entry in self.inner.iter() {
+            let (app, channel) = entry.key();
+            if app == app_id
+                && !present.contains(channel.as_str())
+                && entry.value().read().contains_key(node_id)
+                && may_drop(channel)
+            {
+                entry.value().write().remove(node_id);
+                dropped.push(channel.clone());
+            }
+        }
+        dropped
     }
 
     /// Remove a peer's count explicitly (e.g. peer reported count=0).
@@ -177,6 +224,27 @@ impl PeerUserSessions {
         };
         peer.inserted_at = Instant::now();
         peer.users.remove(user_id)
+    }
+
+    /// Users `node_id` currently reports.
+    pub fn users_of(&self, app_id: &str, node_id: &str) -> HashSet<String> {
+        self.inner
+            .get(app_id)
+            .and_then(|entry| entry.read().get(node_id).map(|e| e.users.clone()))
+            .unwrap_or_default()
+    }
+
+    /// Refresh `node_id`'s liveness, creating an empty entry if needed.
+    pub fn touch(&self, app_id: &str, node_id: &str) {
+        let entry = self.inner.entry(app_id.to_string()).or_default();
+        let mut inner = entry.write();
+        inner
+            .entry(node_id.to_string())
+            .or_insert_with(|| UserSessionEntry {
+                users: HashSet::new(),
+                inserted_at: Instant::now(),
+            })
+            .inserted_at = Instant::now();
     }
 
     /// Replace `node_id`'s set wholesale (periodic snapshot).
@@ -324,5 +392,14 @@ mod tests {
         let expired = c.gc_expired();
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].2, "u1");
+    }
+
+    #[test]
+    fn counts_gc_prunes_channels_with_no_peers_left() {
+        let c = PeerChannelCounts::new();
+        c.set("a", "ch", "n1", 3);
+        c.backdate("a", "ch", "n1", SNAPSHOT_TTL.as_secs() + 1);
+        assert_eq!(c.gc_expired().len(), 1);
+        assert_eq!(c.channel_entries(), 0);
     }
 }

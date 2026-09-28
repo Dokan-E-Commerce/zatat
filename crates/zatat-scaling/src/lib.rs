@@ -7,7 +7,9 @@ pub mod presence_cache;
 pub mod provider;
 pub mod redis;
 
-pub use dispatcher::{EventDispatcher, PublishOverflow};
+pub use dispatcher::{
+    validate_publish, EventDispatcher, FleetTransition, PublishError, PublishOverflow,
+};
 pub use message::{
     ChannelCount, PresenceSnapshotMember, ScalingEnvelope, ScalingPayload, SCALING_VERSION,
     SNAPSHOT_TTL,

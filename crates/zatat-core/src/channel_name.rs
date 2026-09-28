@@ -14,11 +14,14 @@ pub enum ChannelKind {
     PrivateCache,
     PresenceCache,
     PrivateEncrypted,
+    PrivateEncryptedCache,
 }
 
 impl ChannelKind {
     pub fn from_name(name: &str) -> Self {
-        if name.starts_with("private-encrypted-") {
+        if name.starts_with("private-encrypted-cache-") {
+            ChannelKind::PrivateEncryptedCache
+        } else if name.starts_with("private-encrypted-") {
             ChannelKind::PrivateEncrypted
         } else if name.starts_with("presence-cache-") {
             ChannelKind::PresenceCache
@@ -43,6 +46,7 @@ impl ChannelKind {
                 | ChannelKind::PrivateCache
                 | ChannelKind::PresenceCache
                 | ChannelKind::PrivateEncrypted
+                | ChannelKind::PrivateEncryptedCache
         )
     }
 
@@ -53,12 +57,18 @@ impl ChannelKind {
     pub fn is_cache(self) -> bool {
         matches!(
             self,
-            ChannelKind::Cache | ChannelKind::PrivateCache | ChannelKind::PresenceCache
+            ChannelKind::Cache
+                | ChannelKind::PrivateCache
+                | ChannelKind::PresenceCache
+                | ChannelKind::PrivateEncryptedCache
         )
     }
 
     pub fn is_encrypted(self) -> bool {
-        matches!(self, ChannelKind::PrivateEncrypted)
+        matches!(
+            self,
+            ChannelKind::PrivateEncrypted | ChannelKind::PrivateEncryptedCache
+        )
     }
 }
 
@@ -147,6 +157,13 @@ mod tests {
         assert!(ChannelKind::PresenceCache.is_presence());
         assert!(ChannelKind::PrivateEncrypted.is_private());
         assert!(ChannelKind::PrivateCache.is_cache());
+
+        let encrypted_cache = ChannelKind::from_name("private-encrypted-cache-x");
+        assert_eq!(encrypted_cache, ChannelKind::PrivateEncryptedCache);
+        assert!(encrypted_cache.is_private());
+        assert!(encrypted_cache.is_encrypted());
+        assert!(encrypted_cache.is_cache());
+        assert!(!encrypted_cache.is_presence());
     }
 
     #[test]

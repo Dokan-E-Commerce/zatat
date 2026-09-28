@@ -6,24 +6,10 @@ no-default-features = false
 [advisories]
 version = 2
 ignore = [
-    # anyhow::Error::downcast_mut() UB when the error carries added context.
-    # We don't call downcast_mut on contextualized errors anywhere in this
-    # workspace. Fix is a patch bump (>=1.0.103); pinned via Cargo.lock, which
-    # is out of scope for this change.
-    "RUSTSEC-2026-0190",
-    # crossbeam-epoch Display impl derefs a possibly-null Atomic/Shared
-    # pointer. Pulled in transitively by metrics-exporter-prometheus; we
-    # never Display an Atomic/Shared pointer. Fix is a patch bump
-    # (>=0.9.20), pinned via Cargo.lock.
-    "RUSTSEC-2026-0204",
     # rustls-pemfile is unmaintained upstream; no drop-in replacement in the
     # axum-server/reqwest dependency chain we use yet. No safe upgrade
     # published for this advisory.
     "RUSTSEC-2025-0134",
-    # rustls-webpki panic parsing a malformed CRL onlySomeReasons field.
-    # This service never parses certificate revocation lists. Fix is a
-    # patch bump (>=0.103.13), pinned via Cargo.lock.
-    "RUSTSEC-2026-0104",
 ]
 
 [licenses]

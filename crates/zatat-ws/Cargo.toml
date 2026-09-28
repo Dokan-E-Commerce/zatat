@@ -23,3 +23,6 @@ tracing.workspace = true
 metrics.workspace = true
 parking_lot.workspace = true
 dashmap.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true

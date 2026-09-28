@@ -21,3 +21,4 @@ bytes.workspace = true
 hex.workspace = true
 tracing.workspace = true
 hyper.workspace = true
+metrics.workspace = true

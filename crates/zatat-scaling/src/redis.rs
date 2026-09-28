@@ -29,6 +29,17 @@ impl RedisPubSubProvider {
             .build_subscriber_client()
             .map_err(|e| format!("redis subscriber build: {e}"))?;
 
+        watch_connection_events(&publisher, "publisher");
+        // No `on_error` listener on the subscriber: with one attached, fred
+        // 9.4 can end the subscriber's reader without scheduling a reconnect
+        // (reproduced by the Redis-restart scenario). The watchdog below
+        // reports the subscriber's health instead, and also catches that.
+        drop(subscriber.on_reconnect(|server| {
+            metrics::counter!("zatat_redis_reconnects_total", "client" => "subscriber")
+                .increment(1);
+            info!(client = "subscriber", %server, "redis connected");
+            Ok(())
+        }));
         publisher
             .init()
             .await
@@ -43,6 +54,7 @@ impl RedisPubSubProvider {
             .await
             .map_err(|e| format!("redis subscribe: {e}"))?;
         let _resubscribe_task = subscriber.manage_subscriptions();
+        tokio::spawn(subscriber_watchdog(subscriber.clone()));
 
         // Oversized on purpose — a single slow EventDispatcher consumer on
         // the receiving end shouldn't lose messages during a traffic burst.
@@ -104,6 +116,7 @@ impl PubSubProvider for RedisPubSubProvider {
         let value = RedisValue::Bytes(payload.into());
         let res: Result<i64, RedisError> = self.publisher.publish(channel, value).await;
         if let Err(err) = res {
+            metrics::counter!("zatat_redis_publish_failures_total").increment(1);
             warn!(%err, "redis publish failed");
         }
     }
@@ -113,7 +126,72 @@ impl PubSubProvider for RedisPubSubProvider {
     }
 }
 
+const SUBSCRIBER_PING_INTERVAL: Duration = Duration::from_secs(5);
+const SUBSCRIBER_PING_TIMEOUT: Duration = Duration::from_secs(3);
+/// Consecutive failed pings before the subscriber is forcibly reconnected.
+const SUBSCRIBER_MAX_FAILED_PINGS: u32 = 2;
+
+/// A pub/sub connection can die without the client noticing (a half-open
+/// TCP connection, or a reconnect that never gets scheduled), and then
+/// silently receives nothing from other nodes. PING it periodically; after
+/// repeated failures force a reconnect, which re-subscribes via
+/// `manage_subscriptions`.
+async fn subscriber_watchdog(subscriber: SubscriberClient) {
+    let mut tick = tokio::time::interval(SUBSCRIBER_PING_INTERVAL);
+    tick.tick().await;
+    let mut failures = 0u32;
+    loop {
+        tick.tick().await;
+        // In subscribed mode Redis answers PING with an array; accept any reply.
+        let ok = matches!(
+            tokio::time::timeout(SUBSCRIBER_PING_TIMEOUT, subscriber.ping::<RedisValue>()).await,
+            Ok(Ok(_))
+        );
+        metrics::gauge!("zatat_redis_connected", "client" => "subscriber").set(if ok {
+            1.0
+        } else {
+            0.0
+        });
+        if ok {
+            failures = 0;
+            continue;
+        }
+        failures += 1;
+        metrics::counter!("zatat_redis_connection_errors_total", "client" => "subscriber")
+            .increment(1);
+        if failures >= SUBSCRIBER_MAX_FAILED_PINGS {
+            warn!(failures, "redis subscriber unresponsive; forcing reconnect");
+            if let Err(err) = subscriber.force_reconnection().await {
+                warn!(%err, "redis subscriber forced reconnect failed; will retry");
+            }
+            failures = 0;
+        }
+    }
+}
+
+/// Exposes the client's connection lifecycle as metrics:
+/// `zatat_redis_reconnects_total`, `zatat_redis_connection_errors_total` and
+/// `zatat_redis_connected` (1 after a (re)connect, 0 after an error).
+fn watch_connection_events<C: EventInterface>(client: &C, role: &'static str) {
+    // The listener tasks are already spawned; dropping the handles detaches them.
+    drop(client.on_reconnect(move |server| {
+        metrics::counter!("zatat_redis_reconnects_total", "client" => role).increment(1);
+        metrics::gauge!("zatat_redis_connected", "client" => role).set(1.0);
+        info!(client = role, %server, "redis connected");
+        Ok(())
+    }));
+    drop(client.on_error(move |err| {
+        metrics::counter!("zatat_redis_connection_errors_total", "client" => role).increment(1);
+        metrics::gauge!("zatat_redis_connected", "client" => role).set(0.0);
+        warn!(client = role, %err, "redis connection error");
+        Ok(())
+    }));
+}
+
 fn build_builder(cfg: &RedisConfig) -> Result<Builder, RedisError> {
+    // Redis may initialize TLS before the HTTPS listener. Pick a provider
+    // explicitly because transitive dependencies can enable both backends.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let mut builder = match &cfg.url {
         Some(url) => Builder::from_config(RedisConfig_Fred::from_url(url)?),
         None => {
@@ -169,7 +247,8 @@ mod tests {
     fn url_form_tls() {
         let mut cfg = base();
         cfg.url = Some("rediss://127.0.0.1:6379".into());
-        assert!(build_builder(&cfg).is_ok());
+        let builder = build_builder(&cfg).unwrap();
+        assert!(builder.get_config().unwrap().tls.is_some());
     }
 
     #[test]

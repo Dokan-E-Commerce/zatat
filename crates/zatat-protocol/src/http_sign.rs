@@ -56,6 +56,13 @@ pub fn strip_path_prefix<'a>(path: &'a str, prefix: &str) -> &'a str {
     }
 }
 
+/// Lowercase hex MD5 of a request body, as carried in `body_md5`.
+pub fn body_md5_hex(body: &[u8]) -> String {
+    let mut hasher = Md5::new();
+    hasher.update(body);
+    format!("{:x}", hasher.finalize())
+}
+
 fn canonical_http_string(
     method: &str,
     path: &str,
@@ -76,13 +83,14 @@ fn canonical_http_string(
         .collect();
 
     if !body.is_empty() {
-        let mut hasher = Md5::new();
-        hasher.update(body);
-        let digest = format!("{:x}", hasher.finalize());
-        filtered.push(("body_md5".into(), digest));
+        filtered.push(("body_md5".into(), body_md5_hex(body)));
     }
 
-    filtered.sort_by_key(|a| a.0.to_lowercase());
+    // Pusher: "keys converted to lowercase", then sorted.
+    for (k, _) in filtered.iter_mut() {
+        k.make_ascii_lowercase();
+    }
+    filtered.sort_by(|a, b| a.0.cmp(&b.0));
     let qs = filtered
         .iter()
         .map(|(k, v)| format!("{k}={v}"))
@@ -131,6 +139,16 @@ mod tests {
         let body_md5 = format!("{:x}", Md5::digest(body));
         assert_eq!(body_md5, "5cf8efb68580b541236e85114899af81");
         assert!(!sig.is_empty());
+    }
+
+    #[test]
+    fn param_names_are_lowercased_before_signing() {
+        let mixed = vec![("Auth_Key".to_string(), "k".to_string())];
+        let lower = vec![("auth_key".to_string(), "k".to_string())];
+        assert_eq!(
+            sign_http("GET", "/p", b"", &mixed, "s"),
+            sign_http("GET", "/p", b"", &lower, "s")
+        );
     }
 
     #[test]

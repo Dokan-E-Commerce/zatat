@@ -15,6 +15,24 @@ pub const GAUGE_CHANNELS: &str = "zatat_channels_total";
 pub const COUNTER_RATE_LIMITED: &str = "zatat_rate_limited_total";
 pub const COUNTER_REDIS_RECONNECTS: &str = "zatat_redis_reconnects_total";
 
+/// Creates an app's labeled series at zero so dashboards and alerts see
+/// them before the app's first connection. Idempotent: existing values are
+/// only raised, never reset.
+pub fn register_app(app_id: &str) {
+    let app = app_id.to_string();
+    for name in [
+        COUNTER_CONNECTIONS_TOTAL,
+        COUNTER_CONNECTIONS_CLOSED,
+        COUNTER_MESSAGES_SENT,
+        COUNTER_MESSAGES_RECEIVED,
+        COUNTER_RATE_LIMITED,
+    ] {
+        metrics::counter!(name, "app" => app.clone()).increment(0);
+    }
+    metrics::gauge!(GAUGE_CONNECTIONS, "app" => app.clone()).increment(0.0);
+    metrics::gauge!(GAUGE_CHANNELS, "app" => app).increment(0.0);
+}
+
 pub struct MetricsInstaller {
     handle: PrometheusHandle,
     listen: SocketAddr,
@@ -54,17 +72,54 @@ impl MetricsInstaller {
         );
         metrics::describe_gauge!(GAUGE_CHANNELS, "current number of channels");
         metrics::describe_counter!(COUNTER_RATE_LIMITED, "total rate-limit rejections");
-        metrics::describe_counter!(COUNTER_REDIS_RECONNECTS, "total Redis reconnect events");
+        metrics::describe_counter!(
+            COUNTER_REDIS_RECONNECTS,
+            "Redis (re)connections per client (publisher / subscriber)"
+        );
+        metrics::describe_counter!(
+            "zatat_redis_connection_errors_total",
+            "Redis connection errors per client"
+        );
+        metrics::describe_gauge!(
+            "zatat_redis_connected",
+            "1 while the Redis client is connected, 0 after a connection error"
+        );
+        metrics::describe_counter!(
+            "zatat_redis_publish_failures_total",
+            "cross-node payloads Redis rejected; peers never saw them"
+        );
+        metrics::describe_counter!(
+            "zatat_scaling_publish_timeouts_total",
+            "cross-node payloads in batches that did not finish within 5s"
+        );
+        metrics::describe_counter!(
+            "zatat_scaling_publish_drops_total",
+            "cross-node payloads dropped because the publish queue was full"
+        );
+        metrics::describe_counter!(
+            "zatat_webhooks_dropped_total",
+            "webhook events dropped because the queue was full"
+        );
+        metrics::describe_counter!(
+            "zatat_webhooks_failed_total",
+            "webhook deliveries abandoned after the retry window"
+        );
+        metrics::describe_histogram!(
+            "zatat_http_request_duration_seconds",
+            "HTTP API request latency by route, method and status"
+        );
+        metrics::describe_counter!(
+            "zatat_ws_write_timeouts_total",
+            "connections closed because a socket write stalled"
+        );
 
-        // Register the series so `# HELP` / `# TYPE` are exposed before traffic.
-        metrics::counter!(COUNTER_CONNECTIONS_TOTAL).absolute(0);
-        metrics::counter!(COUNTER_CONNECTIONS_CLOSED).absolute(0);
-        metrics::gauge!(GAUGE_CONNECTIONS).set(0.0);
-        metrics::counter!(COUNTER_MESSAGES_SENT).absolute(0);
-        metrics::counter!(COUNTER_MESSAGES_RECEIVED).absolute(0);
-        metrics::gauge!(GAUGE_CHANNELS).set(0.0);
-        metrics::counter!(COUNTER_RATE_LIMITED).absolute(0);
-        metrics::counter!(COUNTER_REDIS_RECONNECTS).absolute(0);
+        // Register app-independent series so `# HELP` / `# TYPE` are exposed
+        // before traffic. Per-app series appear with their `app` label on
+        // first use; registering them unlabeled would add a misleading,
+        // permanently-zero series.
+        metrics::counter!("zatat_redis_publish_failures_total").absolute(0);
+        metrics::counter!("zatat_scaling_publish_drops_total").absolute(0);
+        metrics::counter!("zatat_webhooks_dropped_total").absolute(0);
 
         info!(%listen, "metrics endpoint configured");
         Ok(Self {

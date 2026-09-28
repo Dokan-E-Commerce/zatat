@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use zatat_connection::{ConnectionHandle, Outbound};
 use zatat_core::channel_name::{ChannelKind, ChannelName};
@@ -26,7 +26,18 @@ pub struct Channel {
     user_refcounts: Option<DashMap<String, usize>>,
     cached_payload: Option<RwLock<Option<CachedPayload>>>,
     cache_ttl: Option<Duration>,
+    /// When the last `cache_miss` webhook was requested for this channel.
+    /// Cleared by every publish, so one empty period yields one webhook.
+    cache_miss_notified_at: Mutex<Option<Instant>>,
+    /// Serializes membership changes with everything they produce
+    /// (`member_*` frames, subscription counts, bus messages, webhooks), so
+    /// local members, peers and webhook receivers observe transitions in
+    /// the order they were applied.
+    transitions: Mutex<()>,
 }
+
+/// Repeat a `cache_miss` webhook for a still-empty channel at most this often.
+const CACHE_MISS_WEBHOOK_INTERVAL: Duration = Duration::from_secs(60);
 
 impl Channel {
     pub fn new(name: ChannelName) -> Self {
@@ -50,7 +61,17 @@ impl Channel {
                 None
             },
             cache_ttl,
+            cache_miss_notified_at: Mutex::new(None),
+            transitions: Mutex::new(()),
         }
+    }
+
+    /// Runs `f` while holding this channel's transition lock. Membership
+    /// checks, mutations and every event they produce must happen inside
+    /// one call so they cannot interleave with a concurrent join or leave.
+    pub fn with_transition<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _guard = self.transitions.lock();
+        f()
     }
 
     pub fn name(&self) -> &ChannelName {
@@ -90,6 +111,13 @@ impl Channel {
             .unwrap_or(false)
     }
 
+    /// The presence `user_id` a member socket joined with.
+    pub fn presence_user_id(&self, socket_id: &str) -> Option<String> {
+        self.members
+            .get(socket_id)
+            .and_then(|m| m.presence.as_ref().map(|p| p.user_id.clone()))
+    }
+
     pub fn has_cached_payload(&self) -> bool {
         self.cached_payload().is_some()
     }
@@ -101,11 +129,33 @@ impl Channel {
         if let Some(ttl) = self.cache_ttl {
             if entry.inserted_at.elapsed() > ttl {
                 drop(read);
-                *lock.write() = None;
-                return None;
+                let mut write = lock.write();
+                // A publisher may have replaced the expired entry between
+                // releasing the read lock and acquiring the write lock.
+                if write
+                    .as_ref()
+                    .is_some_and(|current| current.inserted_at.elapsed() > ttl)
+                {
+                    *write = None;
+                }
+                return write.as_ref().map(|current| current.payload.clone());
             }
         }
         Some(entry.payload.clone())
+    }
+
+    /// The cached payload plus its remaining lifetime in whole seconds
+    /// (`None` when the channel has no TTL).
+    pub fn cached_payload_with_ttl(&self) -> Option<(Arc<str>, Option<u64>)> {
+        let payload = self.cached_payload()?;
+        let lock = self.cached_payload.as_ref()?;
+        let remaining = match (self.cache_ttl, lock.read().as_ref()) {
+            (Some(ttl), Some(entry)) => {
+                Some(ttl.saturating_sub(entry.inserted_at.elapsed()).as_secs())
+            }
+            _ => None,
+        };
+        Some((payload, remaining))
     }
 
     pub fn set_cached_payload(&self, payload: Arc<str>) {
@@ -114,7 +164,22 @@ impl Channel {
                 payload,
                 inserted_at: Instant::now(),
             });
+            *self.cache_miss_notified_at.lock() = None;
         }
+    }
+
+    /// Whether a subscriber's cache miss should produce a `cache_miss`
+    /// webhook. Several clients joining an empty channel produce one
+    /// notification; it re-arms after a publish or after
+    /// `CACHE_MISS_WEBHOOK_INTERVAL`.
+    pub fn claim_cache_miss_notification(&self) -> bool {
+        let mut last = self.cache_miss_notified_at.lock();
+        let now = Instant::now();
+        if last.is_some_and(|t| now.duration_since(t) < CACHE_MISS_WEBHOOK_INTERVAL) {
+            return false;
+        }
+        *last = Some(now);
+        true
     }
 
     pub fn cache_ttl(&self) -> Option<Duration> {
@@ -203,6 +268,13 @@ impl Channel {
         if self.kind.is_cache() {
             self.set_cached_payload(payload);
         }
+    }
+
+    /// Client events are relayed like user events but never cached: Pusher
+    /// only replays server-published events to late cache subscribers, and
+    /// caching them would let any member overwrite the channel's state.
+    pub fn broadcast_client_event(&self, payload: Arc<str>, except: Option<&SocketId>) {
+        self.send_to_members(&payload, except);
     }
 
     /// Broadcast for `pusher_internal:*` / `pusher:error` / `cache_miss` /
@@ -355,5 +427,26 @@ mod tests {
                 "iteration {iteration}: expected exactly one user_removed, got {removed_count}"
             );
         }
+    }
+
+    #[test]
+    fn cache_miss_webhook_is_claimed_once_per_empty_period() {
+        let ch = Channel::with_cache_ttl(ChannelName::new("cache-x".to_string()), None);
+        assert!(ch.claim_cache_miss_notification());
+        assert!(!ch.claim_cache_miss_notification());
+        ch.set_cached_payload(Arc::from("{}"));
+        assert!(ch.claim_cache_miss_notification(), "a publish re-arms it");
+    }
+
+    #[test]
+    fn cached_payload_reports_remaining_ttl() {
+        let ch = Channel::with_cache_ttl(
+            ChannelName::new("cache-x".to_string()),
+            Some(Duration::from_secs(1800)),
+        );
+        assert!(ch.cached_payload_with_ttl().is_none());
+        ch.set_cached_payload(Arc::from("{}"));
+        let (_, ttl) = ch.cached_payload_with_ttl().unwrap();
+        assert!(matches!(ttl, Some(1799 | 1800)), "{ttl:?}");
     }
 }

@@ -15,7 +15,7 @@ use zatat_config::Config;
 use zatat_core::application::AppArc;
 use zatat_core::channel_name::{is_valid_channel_name, MAX_CHANNEL_NAME_LEN, MAX_EVENT_NAME_LEN};
 use zatat_core::id::{AppId, SocketId};
-use zatat_scaling::EventDispatcher;
+use zatat_scaling::{validate_publish, EventDispatcher};
 use zatat_webhooks::WebhookDispatcher;
 
 use crate::sign::{verify_request, VerifyError};
@@ -40,14 +40,62 @@ pub fn build_api_router(state: ApiState) -> Router {
         .route("/apps/:app_id/channels", get(list_channels))
         .route("/apps/:app_id/channels/:channel", get(channel_info))
         .route("/apps/:app_id/channels/:channel/users", get(channel_users))
+        .route("/apps/:app_id/connections", get(connections))
         .route("/apps/:app_id/users/:user_id/events", post(user_events))
         .route("/apps/:app_id/users/:user_id", delete(terminate_user))
         .route(
             "/apps/:app_id/users/:user_id/terminate_connections",
             post(terminate_user_pusher),
         )
+        .route_layer(axum::middleware::from_fn(move |req, next| {
+            deadline_and_metrics(max_body, req, next)
+        }))
         .layer(DefaultBodyLimit::max(max_body))
         .with_state(state)
+}
+
+/// Deadline for receiving a request body, so a client that trickles its
+/// body cannot hold a handler open indefinitely. Only the read is bounded:
+/// once the handler starts publishing, it is never cut short (a timeout
+/// then could report failure for an event that was already delivered).
+const BODY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Reads the body under `BODY_READ_TIMEOUT` and `max_body`, runs the
+/// handler, and records `zatat_http_request_duration_seconds` per route,
+/// method and status.
+async fn deadline_and_metrics(
+    max_body: usize,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let route = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_default();
+    let method = request.method().to_string();
+    let started = std::time::Instant::now();
+    let (parts, body) = request.into_parts();
+    let response =
+        match tokio::time::timeout(BODY_READ_TIMEOUT, axum::body::to_bytes(body, max_body)).await {
+            Err(_) => ApiError(408, "request body not received in time".into()).into_response(),
+            Ok(Err(_)) => ApiError(413, "request body too large".into()).into_response(),
+            Ok(Ok(bytes)) => {
+                next.run(axum::extract::Request::from_parts(
+                    parts,
+                    axum::body::Body::from(bytes),
+                ))
+                .await
+            }
+        };
+    metrics::histogram!(
+        "zatat_http_request_duration_seconds",
+        "route" => route,
+        "method" => method,
+        "status" => response.status().as_u16().to_string(),
+    )
+    .record(started.elapsed().as_secs_f64());
+    response
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -125,30 +173,90 @@ fn verify_and_log(
     Ok(())
 }
 
-fn channel_stats_object(s: &ChannelStats, info_csv: Option<&str>) -> Value {
-    let wants = |k: &str| match info_csv {
-        Some(s) => s.split(',').any(|p| p.trim() == k),
-        None => false,
-    };
+/// Pusher: at most 100 channels per event.
+const MAX_CHANNELS_PER_EVENT: usize = 100;
+
+fn wants(info_csv: Option<&str>, attribute: &str) -> bool {
+    info_csv.is_some_and(|s| s.split(',').any(|p| p.trim() == attribute))
+}
+
+/// Renders the requested `info` attributes. `cache` is the channel's cached
+/// event as Pusher reports it (`{"data": .., "ttl": ..}`, or null).
+fn channel_stats_object(s: &ChannelStats, info_csv: Option<&str>, cache: Option<Value>) -> Value {
     let mut obj = serde_json::Map::new();
-    if wants("occupied") {
+    if wants(info_csv, "occupied") {
         obj.insert("occupied".into(), Value::Bool(s.occupied));
     }
-    if wants("subscription_count") {
+    if wants(info_csv, "subscription_count") {
         obj.insert(
             "subscription_count".into(),
             Value::from(s.subscription_count),
         );
     }
-    if wants("user_count") {
+    if wants(info_csv, "user_count") {
         if let Some(u) = s.user_count {
             obj.insert("user_count".into(), Value::from(u));
         }
     }
-    if wants("cache") {
-        obj.insert("cache".into(), Value::Bool(s.has_cached_payload));
+    if wants(info_csv, "cache") {
+        obj.insert("cache".into(), cache.unwrap_or(Value::Null));
     }
     Value::Object(obj)
+}
+
+/// The cached event of a cache channel: its `data` and remaining TTL.
+fn cache_info(state: &ApiState, app: &AppArc, channel: &str) -> Option<Value> {
+    let ch = state.channels.find_channel(&app.id, channel)?;
+    let (payload, ttl) = ch.cached_payload_with_ttl()?;
+    let data = serde_json::from_str::<Value>(&payload)
+        .ok()
+        .and_then(|frame| frame.get("data").cloned())
+        .unwrap_or(Value::Null);
+    Some(json!({ "data": data, "ttl": ttl }))
+}
+
+/// Channel stats across the fleet: local subscribers plus what peers report.
+fn fleet_channel_stats(state: &ApiState, app: &AppArc, channel: &str) -> ChannelStats {
+    let local = state.channels.channel_stats(&app.id, channel);
+    let is_presence = zatat_core::channel_name::ChannelKind::from_name(channel).is_presence();
+    let local_count = local.as_ref().map(|s| s.subscription_count).unwrap_or(0);
+    let has_cached_payload = local
+        .as_ref()
+        .map(|s| s.has_cached_payload)
+        .unwrap_or(false);
+    let (subscription_count, user_count, occupied) = if is_presence {
+        let mut user_ids = std::collections::BTreeSet::new();
+        if let Some(ch) = state.channels.find_channel(&app.id, channel) {
+            for (_, _, presence) in ch.members_iter() {
+                if let Some(m) = presence {
+                    user_ids.insert(m.user_id);
+                }
+            }
+        }
+        let remote_members = state
+            .dispatcher
+            .presence_cache()
+            .remote_members_for(app.id.as_str(), channel);
+        let has_remote_members = !remote_members.is_empty();
+        for m in remote_members {
+            user_ids.insert(m.user_id);
+        }
+        let occupied = local_count > 0 || has_remote_members;
+        (local_count, Some(user_ids.len()), occupied)
+    } else {
+        let peer_sum = state
+            .dispatcher
+            .peer_channel_counts()
+            .sum(app.id.as_str(), channel);
+        let occupied = local_count > 0 || peer_sum > 0;
+        (local_count + peer_sum, None, occupied)
+    };
+    ChannelStats {
+        occupied,
+        subscription_count,
+        user_count,
+        has_cached_payload,
+    }
 }
 
 async fn publish_event(
@@ -169,19 +277,16 @@ async fn publish_event(
 
     let payload: EventPayload =
         serde_json::from_slice(&body).map_err(|e| ApiError(422, format!("invalid body: {e}")))?;
-    validate_event_payload(&payload)?;
+    validate_event_payload(&app, &payload)?;
 
     let info_requested = payload.info.clone();
     let channels_list = event_channels(&payload);
-    dispatch_event(&state, &app, payload).await;
+    dispatch_event(&state, &app, payload).await?;
     if let Some(info) = info_requested {
         let mut per_channel = serde_json::Map::new();
         for ch in channels_list {
-            let stats = state.channels.channel_stats(&app.id, &ch);
-            let obj = stats
-                .map(|s| channel_stats_object(&s, Some(&info)))
-                .unwrap_or_else(|| json!({}));
-            per_channel.insert(ch, obj);
+            let stats = fleet_channel_stats(&state, &app, &ch);
+            per_channel.insert(ch, channel_stats_object(&stats, Some(&info), None));
         }
         return Ok((StatusCode::OK, Json(json!({ "channels": per_channel }))).into_response());
     }
@@ -212,24 +317,25 @@ async fn publish_batch_events(
             "batch must contain at least one event".into(),
         ));
     }
+    // Validate the whole batch first so a bad event rejects the request
+    // before any event in it is delivered.
     for ev in &payload.batch {
-        validate_event_payload(ev)?;
+        validate_event_payload(&app, ev)?;
     }
 
     // Pusher spec: `batch` in the response is same-length as the input,
-    // with per-event stats whenever that event requested `info`.
+    // with per-event stats whenever that event requested `info`; without
+    // any `info` the response is an empty object.
     let any_info = payload.batch.iter().any(|ev| ev.info.is_some());
     let mut out: Vec<Value> = Vec::with_capacity(payload.batch.len());
     for ev in payload.batch {
         let info = ev.info.clone();
         let first_channel = event_channels(&ev).into_iter().next();
-        dispatch_event(&state, &app, ev).await;
+        dispatch_event(&state, &app, ev).await?;
         let entry = match (info, first_channel) {
-            (Some(info), Some(ch)) => state
-                .channels
-                .channel_stats(&app.id, &ch)
-                .map(|s| channel_stats_object(&s, Some(&info)))
-                .unwrap_or_else(|| json!({})),
+            (Some(info), Some(ch)) => {
+                channel_stats_object(&fleet_channel_stats(&state, &app, &ch), Some(&info), None)
+            }
             _ => json!({}),
         };
         out.push(entry);
@@ -237,11 +343,11 @@ async fn publish_batch_events(
     if any_info {
         Ok((StatusCode::OK, Json(json!({ "batch": out }))).into_response())
     } else {
-        Ok((StatusCode::OK, Json(json!({ "batch": [] }))).into_response())
+        Ok((StatusCode::OK, Json(json!({}))).into_response())
     }
 }
 
-async fn dispatch_event(state: &ApiState, app: &AppArc, ev: EventPayload) {
+async fn dispatch_event(state: &ApiState, app: &AppArc, ev: EventPayload) -> Result<(), ApiError> {
     let channels = event_channels(&ev);
     let data_str = data_to_string(&ev.data);
     let except = ev.socket_id.map(SocketId::from_string);
@@ -256,21 +362,35 @@ async fn dispatch_event(state: &ApiState, app: &AppArc, ev: EventPayload) {
                 data_str.clone(),
                 except.clone(),
             )
-            .await;
+            .await
+            .map_err(|err| ApiError(500, err.to_string()))?;
     }
+    Ok(())
 }
 
-fn validate_event_payload(ev: &EventPayload) -> Result<(), ApiError> {
-    if ev.name.is_empty() {
+fn validate_event_name(name: &str) -> Result<(), ApiError> {
+    if name.is_empty() {
         return Err(ApiError(400, "event name is required".into()));
     }
-    if ev.name.len() > MAX_EVENT_NAME_LEN {
+    if name.len() > MAX_EVENT_NAME_LEN {
         return Err(ApiError(
             422,
             format!("event name exceeds {MAX_EVENT_NAME_LEN} bytes"),
         ));
     }
+    Ok(())
+}
+
+fn validate_event_payload(app: &AppArc, ev: &EventPayload) -> Result<(), ApiError> {
+    validate_event_name(&ev.name)?;
     let channels = event_channels(ev);
+    if channels.len() > MAX_CHANNELS_PER_EVENT {
+        return Err(ApiError(
+            400,
+            format!("an event may target at most {MAX_CHANNELS_PER_EVENT} channels"),
+        ));
+    }
+    let data = data_to_string(&ev.data);
     if channels.is_empty() {
         // Publishing with no target is a publisher contract violation — do
         // NOT silently 200. Pusher's docs require at least one of `channel`
@@ -297,6 +417,9 @@ fn validate_event_payload(ev: &EventPayload) -> Result<(), ApiError> {
         } else if !is_valid_channel_name(&ch) {
             return Err(ApiError(400, format!("invalid channel name: {ch}")));
         }
+        // e.g. plaintext for an encrypted channel with no master key: reject
+        // instead of acknowledging an event nobody will receive.
+        validate_publish(app, &ch, &data).map_err(|err| ApiError(400, format!("{ch}: {err}")))?;
     }
     Ok(())
 }
@@ -378,6 +501,7 @@ async fn list_channels(
             zatat_scaling::message::MetricsQuery {
                 filter_by_prefix: filter.map(|s| s.to_string()),
                 info: info.map(|s| s.to_string()),
+                connections_only: false,
             },
             std::time::Duration::from_millis(750),
         )
@@ -396,8 +520,13 @@ async fn list_channels(
         }
     }
 
+    // Pusher lists occupied channels only (a cache channel can exist here
+    // just to hold its last event), and always as an object.
     let mut obj = serde_json::Map::new();
     for (name, m) in merged {
+        if !m.occupied {
+            continue;
+        }
         let stats = zatat_channels::ChannelStats {
             occupied: m.occupied,
             subscription_count: m.subscription_count,
@@ -408,14 +537,14 @@ async fn list_channels(
             },
             has_cached_payload: m.has_cached_payload,
         };
-        obj.insert(name, channel_stats_object(&stats, info));
+        let cache = if wants(info, "cache") {
+            cache_info(&state, &app, &name)
+        } else {
+            None
+        };
+        obj.insert(name, channel_stats_object(&stats, info, cache));
     }
-    let channels_value = if obj.is_empty() {
-        Value::Array(Vec::new())
-    } else {
-        Value::Object(obj)
-    };
-    Ok(Json(json!({ "channels": channels_value })).into_response())
+    Ok(Json(json!({ "channels": Value::Object(obj) })).into_response())
 }
 
 async fn channel_info(
@@ -443,49 +572,13 @@ async fn channel_info(
         _ => "occupied,subscription_count".into(),
     };
 
-    let local = state.channels.channel_stats(&app.id, &channel);
-    let is_presence = zatat_core::channel_name::ChannelKind::from_name(&channel).is_presence();
-    let local_count = local.as_ref().map(|s| s.subscription_count).unwrap_or(0);
-    let has_cached_payload = local
-        .as_ref()
-        .map(|s| s.has_cached_payload)
-        .unwrap_or(false);
-
-    let (subscription_count, user_count, occupied) = if is_presence {
-        let mut user_ids = std::collections::BTreeSet::new();
-        if let Some(ch) = state.channels.find_channel(&app.id, &channel) {
-            for (_, _, presence) in ch.members_iter() {
-                if let Some(m) = presence {
-                    user_ids.insert(m.user_id);
-                }
-            }
-        }
-        let remote_members = state
-            .dispatcher
-            .presence_cache()
-            .remote_members_for(app.id.as_str(), &channel);
-        let has_remote_members = !remote_members.is_empty();
-        for m in remote_members {
-            user_ids.insert(m.user_id);
-        }
-        let occupied = local_count > 0 || has_remote_members;
-        (local_count, Some(user_ids.len()), occupied)
+    let merged = fleet_channel_stats(&state, &app, &channel);
+    let cache = if wants(info, "cache") {
+        cache_info(&state, &app, &channel)
     } else {
-        let peer_sum = state
-            .dispatcher
-            .peer_channel_counts()
-            .sum(app.id.as_str(), &channel);
-        let occupied = local_count > 0 || peer_sum > 0;
-        (local_count + peer_sum, None, occupied)
+        None
     };
-
-    let merged = zatat_channels::ChannelStats {
-        occupied,
-        subscription_count,
-        user_count,
-        has_cached_payload,
-    };
-    let stats = channel_stats_object(&merged, Some(&info_plus_occupied));
+    let stats = channel_stats_object(&merged, Some(&info_plus_occupied), cache);
     Ok(Json(stats).into_response())
 }
 
@@ -544,6 +637,10 @@ async fn user_events(
 
     let payload: UserEventPayload =
         serde_json::from_slice(&body).map_err(|e| ApiError(400, format!("invalid body: {e}")))?;
+    validate_event_name(&payload.name)?;
+    if user_id.is_empty() {
+        return Err(ApiError(400, "user id is required".into()));
+    }
     let data_str = data_to_string(&payload.data);
 
     let handles_before = state.channels.connections_for_user(&app.id, &user_id).len();
@@ -553,6 +650,30 @@ async fn user_events(
         .await;
 
     Ok((StatusCode::OK, Json(json!({ "delivered": handles_before }))).into_response())
+}
+
+/// Live connection count across the fleet (Reverb's `/connections`).
+async fn connections(
+    Path(app_id): Path<String>,
+    State(state): State<ApiState>,
+    method_uri: MethodUri,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let app = resolve_app(&state, &app_id)?;
+    verify_and_log(
+        &app,
+        &method_uri,
+        &state.config.server.path,
+        &Bytes::new(),
+        &headers,
+    )?;
+    let local = state.channels.connection_count(&app.id);
+    let peers = state
+        .dispatcher
+        .ask_fleet_for_connections(&app, std::time::Duration::from_millis(750))
+        .await
+        .unwrap_or(0);
+    Ok(Json(json!({ "connections": local + peers })).into_response())
 }
 
 async fn terminate_user(

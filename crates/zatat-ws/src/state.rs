@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use tokio::sync::broadcast;
+use tokio::sync::watch;
 
 use zatat_channels::ChannelManager;
 use zatat_config::Config;
@@ -16,7 +16,10 @@ pub struct ServerStateInner {
     pub channels: ChannelManager,
     pub dispatcher: Arc<EventDispatcher>,
     pub webhooks: Arc<WebhookDispatcher>,
-    pub shutdown: broadcast::Sender<()>,
+    /// Flips to `true` once when the server starts draining. A `watch`
+    /// (not a one-shot broadcast) so connections that arrive after the flip
+    /// still observe it.
+    pub shutdown: watch::Sender<bool>,
     pub tracker: crate::tasks::ConnectionTracker,
 }
 
@@ -71,7 +74,20 @@ impl ServerStateInner {
             },
             webhook_overflow,
         ));
-        let (shutdown, _) = broadcast::channel(1);
+        // Fleet transitions this node reports on another node's behalf.
+        let webhooks_for_dispatcher = webhooks.clone();
+        dispatcher.set_transition_sink(move |app, transition| {
+            let event = match transition {
+                zatat_scaling::FleetTransition::MemberRemoved { channel, user_id } => {
+                    zatat_webhooks::WebhookEvent::MemberRemoved { channel, user_id }
+                }
+                zatat_scaling::FleetTransition::ChannelVacated { channel } => {
+                    zatat_webhooks::WebhookEvent::ChannelVacated { channel }
+                }
+            };
+            webhooks_for_dispatcher.enqueue(app.id.as_str(), event);
+        });
+        let (shutdown, _) = watch::channel(false);
         Arc::new(Self {
             config,
             channels,
@@ -82,8 +98,21 @@ impl ServerStateInner {
         })
     }
 
+    /// Enter draining: new upgrades are refused, `/health` reports 503 so
+    /// load balancers stop routing here, and every live connection is closed
+    /// with 1001. Idempotent.
     pub fn shutdown_now(&self) {
-        let _ = self.shutdown.send(());
+        self.shutdown.send_replace(true);
+    }
+
+    pub fn is_draining(&self) -> bool {
+        *self.shutdown.borrow()
+    }
+
+    /// Resolves once draining has begun, whatever triggered it.
+    pub async fn draining(&self) {
+        let mut rx = self.shutdown.subscribe();
+        let _ = rx.wait_for(|draining| *draining).await;
     }
 
     pub fn connection_count_total(&self) -> usize {

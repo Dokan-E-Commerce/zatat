@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -9,7 +9,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::Sha256;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, warn};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -90,6 +90,28 @@ impl WebhookEvent {
         }
     }
 
+    /// Rough heap footprint, for the `Block` staging byte budget.
+    fn approx_size(&self) -> usize {
+        let payload = match self {
+            WebhookEvent::MemberAdded { user_id, .. }
+            | WebhookEvent::MemberRemoved { user_id, .. } => user_id.len(),
+            WebhookEvent::ClientEvent {
+                event,
+                data,
+                socket_id,
+                user_id,
+                ..
+            } => {
+                event.len()
+                    + data.len()
+                    + socket_id.as_ref().map_or(0, String::len)
+                    + user_id.as_ref().map_or(0, String::len)
+            }
+            _ => 0,
+        };
+        std::mem::size_of::<Self>() + self.channel().len() + payload
+    }
+
     fn to_event_json(&self) -> Value {
         let name = self.name();
         match self {
@@ -148,6 +170,15 @@ const DROP_WARN_INTERVAL: Duration = Duration::from_secs(5);
 /// `enqueue()` starts dropping with the existing counter) rather than
 /// unbounded-spawning.
 const MAX_IN_FLIGHT_DELIVERIES: usize = 256;
+/// Pusher retries a failed webhook with exponential backoff for 5 minutes.
+const RETRY_WINDOW: Duration = Duration::from_secs(300);
+const INITIAL_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(60);
+/// Deliveries waiting to retry hold no delivery slot, only memory; past
+/// this many a newly failing delivery is abandoned (and counted).
+const MAX_PENDING_RETRIES: usize = 10_000;
+/// Byte budget for `Block` mode's ordered staging buffer.
+const BLOCK_STAGING_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// What to do when the in-memory webhook queue is full.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -156,25 +187,33 @@ pub enum WebhookOverflow {
     /// Default — never blocks the caller.
     #[default]
     BestEffort,
-    /// Back-pressure: `enqueue()` awaits a slot on a background task.
-    /// Zero loss at the cost of slower producers under sustained overload.
+    /// Absorb overload in an ordered staging buffer of up to
+    /// `BLOCK_STAGING_MAX_BYTES` in front of the bounded queue; drop and
+    /// count only once that is exhausted. `enqueue()` never waits.
     Block,
+}
+
+/// `Block` mode's staging buffer: an ordered queue with a byte budget.
+struct BlockStaging {
+    tx: mpsc::UnboundedSender<(String, WebhookEvent)>,
+    bytes: Arc<AtomicUsize>,
+    limit: usize,
 }
 
 pub struct WebhookDispatcher {
     tx: mpsc::Sender<(String, WebhookEvent)>,
     overflow: WebhookOverflow,
     /// Only `Some` when `overflow` is `Block`. The producer side sends here
-    /// synchronously (never blocks, never spawns); a single dedicated
-    /// forwarder task drains it in order into the bounded `tx` queue,
-    /// awaiting a slot as needed. This preserves enqueue order and avoids
-    /// the per-message `tokio::spawn` pattern that let a stalled consumer
-    /// accumulate unbounded tasks.
-    block_tx: Option<mpsc::UnboundedSender<(String, WebhookEvent)>>,
+    /// synchronously (never blocks, never spawns) within a byte budget; a
+    /// single dedicated forwarder task drains it in order into the bounded
+    /// `tx` queue, awaiting a slot as needed.
+    block_tx: Option<BlockStaging>,
     drops_total: Arc<AtomicU64>,
     last_drop_warn: Arc<Mutex<Option<Instant>>>,
     in_flight: Arc<AtomicU64>,
     delivery_semaphore: Arc<Semaphore>,
+    /// 1 while the drain loop holds an event it has not handed off yet.
+    dequeued: Arc<AtomicUsize>,
 }
 
 impl WebhookDispatcher {
@@ -201,8 +240,15 @@ impl WebhookDispatcher {
 
         let in_flight_drain = in_flight.clone();
         let sem_drain = sem.clone();
+        let pending_retries = Arc::new(AtomicUsize::new(0));
+        let dequeued = Arc::new(AtomicUsize::new(0));
+        let dequeued_drain = dequeued.clone();
         tokio::spawn(async move {
+            let dequeued = dequeued_drain;
             while let Some((app_id, event)) = rx.recv().await {
+                // Counted as pending while this loop holds it, including
+                // while it waits for a delivery slot.
+                dequeued.store(1, Ordering::Relaxed);
                 let targets = (lookup)(&app_id);
                 for t in targets {
                     if !matches_filters(&t, &event) {
@@ -222,34 +268,46 @@ impl WebhookDispatcher {
                     let in_flight_tx = in_flight_drain.clone();
                     let client = client.clone();
                     let event_for_task = event.clone();
+                    let retry = RetryContext {
+                        semaphore: sem_drain.clone(),
+                        pending: pending_retries.clone(),
+                    };
                     tokio::spawn(async move {
-                        let _permit = permit; // dropped at end -> releases slot
                         metrics::gauge!("zatat_webhooks_in_flight")
                             .set(in_flight_tx.load(Ordering::Relaxed) as f64);
-                        deliver(client, t, event_for_task).await;
+                        deliver(client, t, event_for_task, permit, retry).await;
                         in_flight_tx.fetch_sub(1, Ordering::Relaxed);
                         metrics::gauge!("zatat_webhooks_in_flight")
                             .set(in_flight_tx.load(Ordering::Relaxed) as f64);
                     });
                 }
+                dequeued.store(0, Ordering::Relaxed);
             }
         });
 
-        // In `Block` mode, a single dedicated forwarder task drains an
-        // unbounded queue into the bounded `tx`, one item at a time,
-        // preserving order without spawning a task per message.
+        // In `Block` mode, a single dedicated forwarder task drains the
+        // byte-budgeted staging queue into the bounded `tx`, one item at a
+        // time, preserving order without spawning a task per message.
         let block_tx = if overflow == WebhookOverflow::Block {
             let bounded_tx = tx.clone();
-            let (unbounded_tx, mut unbounded_rx) =
-                mpsc::unbounded_channel::<(String, WebhookEvent)>();
+            let (staging_tx, mut staging_rx) = mpsc::unbounded_channel::<(String, WebhookEvent)>();
+            let bytes = Arc::new(AtomicUsize::new(0));
+            let staged = bytes.clone();
             tokio::spawn(async move {
-                while let Some(item) = unbounded_rx.recv().await {
-                    if bounded_tx.send(item).await.is_err() {
+                while let Some(item) = staging_rx.recv().await {
+                    let size = item.1.approx_size();
+                    let sent = bounded_tx.send(item).await;
+                    staged.fetch_sub(size, Ordering::Relaxed);
+                    if sent.is_err() {
                         break;
                     }
                 }
             });
-            Some(unbounded_tx)
+            Some(BlockStaging {
+                tx: staging_tx,
+                bytes,
+                limit: BLOCK_STAGING_MAX_BYTES,
+            })
         } else {
             None
         };
@@ -262,45 +320,63 @@ impl WebhookDispatcher {
             last_drop_warn: Arc::new(Mutex::new(None)),
             in_flight,
             delivery_semaphore: sem,
+            dequeued,
         }
     }
 
     pub fn enqueue(&self, app_id: &str, event: WebhookEvent) {
+        let staged = self
+            .block_tx
+            .as_ref()
+            .map_or(0, |s| s.bytes.load(Ordering::Relaxed));
         metrics::gauge!("zatat_webhooks_queue_depth")
             .set((WEBHOOK_QUEUE_CAPACITY - self.tx.capacity()) as f64);
+        metrics::gauge!("zatat_webhooks_staging_bytes").set(staged as f64);
         match self.overflow {
             WebhookOverflow::BestEffort => {
                 if self.tx.try_send((app_id.to_string(), event)).is_err() {
-                    let prev = self.drops_total.fetch_add(1, Ordering::Relaxed) + 1;
-                    metrics::counter!("zatat_webhooks_dropped_total").increment(1);
-                    let mut last = self.last_drop_warn.lock();
-                    let now = Instant::now();
-                    let should_warn = match *last {
-                        None => true,
-                        Some(t) => now.duration_since(t) >= DROP_WARN_INTERVAL,
-                    };
-                    if should_warn {
-                        *last = Some(now);
-                        drop(last);
-                        warn!(
-                            app = %app_id,
-                            total_drops = prev,
-                            "webhook queue FULL — dropping event; consumer cannot keep up"
-                        );
-                    }
+                    self.record_drop(app_id);
                 }
             }
             WebhookOverflow::Block => {
-                // Hand off to the unbounded `block_tx`; the single forwarder
-                // task drains it into the bounded queue in order. Zero
-                // loss. A sustained overload backs up until the consumer
-                // catches up, so the caller still returns immediately but
-                // in-memory pressure rises. The queue-depth gauge is the
-                // load-shedding signal.
-                if let Some(block_tx) = &self.block_tx {
-                    let _ = block_tx.send((app_id.to_string(), event));
+                let Some(staging) = &self.block_tx else {
+                    return;
+                };
+                let size = event.approx_size();
+                let reserved =
+                    staging
+                        .bytes
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                            (used + size <= staging.limit).then_some(used + size)
+                        });
+                if reserved.is_err() {
+                    self.record_drop(app_id);
+                    return;
+                }
+                if staging.tx.send((app_id.to_string(), event)).is_err() {
+                    staging.bytes.fetch_sub(size, Ordering::Relaxed);
                 }
             }
+        }
+    }
+
+    fn record_drop(&self, app_id: &str) {
+        let prev = self.drops_total.fetch_add(1, Ordering::Relaxed) + 1;
+        metrics::counter!("zatat_webhooks_dropped_total").increment(1);
+        let mut last = self.last_drop_warn.lock();
+        let now = Instant::now();
+        let should_warn = match *last {
+            None => true,
+            Some(t) => now.duration_since(t) >= DROP_WARN_INTERVAL,
+        };
+        if should_warn {
+            *last = Some(now);
+            drop(last);
+            warn!(
+                app = %app_id,
+                total_drops = prev,
+                "webhook queue FULL — dropping event; consumer cannot keep up"
+            );
         }
     }
 
@@ -313,6 +389,20 @@ impl WebhookDispatcher {
     /// MAX_IN_FLIGHT_DELIVERIES by the internal semaphore.
     pub fn in_flight(&self) -> u64 {
         self.in_flight.load(Ordering::Relaxed)
+    }
+
+    /// Work not yet finished: queued events, staged `Block` events and
+    /// deliveries in flight or awaiting a retry. Zero once fully drained.
+    pub fn pending(&self) -> usize {
+        let queued = WEBHOOK_QUEUE_CAPACITY - self.tx.capacity();
+        let staged = self
+            .block_tx
+            .as_ref()
+            .map_or(0, |s| usize::from(s.bytes.load(Ordering::Relaxed) > 0));
+        queued
+            + staged
+            + self.dequeued.load(Ordering::Relaxed)
+            + self.in_flight.load(Ordering::Relaxed) as usize
     }
 
     /// Available permits for new deliveries (for health checks).
@@ -333,20 +423,43 @@ fn matches_filters(target: &CompiledTarget, event: &WebhookEvent) -> bool {
     true
 }
 
-fn should_retry(status: reqwest::StatusCode) -> bool {
-    matches!(status.as_u16(), 408 | 429) || status.is_server_error()
+/// Shared state that lets a delivery retry without holding a delivery slot
+/// while it waits.
+struct RetryContext {
+    semaphore: Arc<Semaphore>,
+    pending: Arc<AtomicUsize>,
 }
 
-async fn deliver(client: reqwest::Client, target: CompiledTarget, event: WebhookEvent) {
+/// Delivers one event to one target. Like Pusher, any non-2xx response or
+/// transport error is retried with exponential backoff until
+/// `RETRY_WINDOW` has elapsed. The delivery slot (`permit`) is held only
+/// while a request is in flight.
+async fn deliver(
+    client: reqwest::Client,
+    target: CompiledTarget,
+    event: WebhookEvent,
+    permit: OwnedSemaphorePermit,
+    retry: RetryContext,
+) {
     let envelope = json!({
         "time_ms": now_millis(),
         "events": [event.to_event_json()],
     });
     let body = serde_json::to_vec(&envelope).unwrap_or_default();
     let signature = sign_body(&target.app_secret, &body);
+    let started = Instant::now();
+    let mut backoff = INITIAL_RETRY_BACKOFF;
+    let mut permit = Some(permit);
+    let mut counted_as_pending = false;
     let mut attempts = 0u32;
-    let mut backoff_ms = 500u64;
-    loop {
+    let delivered = loop {
+        let slot = match permit.take() {
+            Some(p) => p,
+            None => match retry.semaphore.clone().acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => break false,
+            },
+        };
         attempts += 1;
         let res = client
             .post(&target.url)
@@ -356,29 +469,38 @@ async fn deliver(client: reqwest::Client, target: CompiledTarget, event: Webhook
             .body(body.clone())
             .send()
             .await;
+        drop(slot);
         match res {
-            Ok(r) if r.status().is_success() => {
-                debug!(app = %target.app_id, url = %target.url, "webhook delivered");
-                return;
-            }
+            Ok(r) if r.status().is_success() => break true,
             Ok(r) => {
-                let status = r.status();
-                warn!(app = %target.app_id, url = %target.url, %status, "webhook non-2xx");
-                if !should_retry(status) {
-                    warn!(app = %target.app_id, url = %target.url, %status, "webhook failure is permanent — not retrying");
-                    return;
-                }
+                warn!(app = %target.app_id, url = %target.url, status = %r.status(), attempts, "webhook non-2xx");
             }
             Err(err) => {
-                warn!(app = %target.app_id, url = %target.url, %err, "webhook transport error");
+                warn!(app = %target.app_id, url = %target.url, %err, attempts, "webhook transport error");
             }
         }
-        if attempts >= 4 {
-            warn!(app = %target.app_id, url = %target.url, "webhook giving up after 4 attempts");
-            return;
+        if started.elapsed() + backoff > RETRY_WINDOW {
+            break false;
         }
-        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-        backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
+        if !counted_as_pending {
+            if retry.pending.fetch_add(1, Ordering::Relaxed) >= MAX_PENDING_RETRIES {
+                retry.pending.fetch_sub(1, Ordering::Relaxed);
+                warn!(app = %target.app_id, url = %target.url, "too many webhooks awaiting retry; abandoning this one");
+                break false;
+            }
+            counted_as_pending = true;
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(MAX_RETRY_BACKOFF);
+    };
+    if counted_as_pending {
+        retry.pending.fetch_sub(1, Ordering::Relaxed);
+    }
+    if delivered {
+        debug!(app = %target.app_id, url = %target.url, attempts, "webhook delivered");
+    } else {
+        metrics::counter!("zatat_webhooks_failed_total").increment(1);
+        warn!(app = %target.app_id, url = %target.url, attempts, "webhook delivery abandoned");
     }
 }
 
@@ -398,22 +520,6 @@ fn now_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn should_retry_transient_statuses() {
-        assert!(should_retry(reqwest::StatusCode::REQUEST_TIMEOUT));
-        assert!(should_retry(reqwest::StatusCode::TOO_MANY_REQUESTS));
-        assert!(should_retry(reqwest::StatusCode::INTERNAL_SERVER_ERROR));
-        assert!(should_retry(reqwest::StatusCode::SERVICE_UNAVAILABLE));
-    }
-
-    #[test]
-    fn should_retry_permanent_statuses() {
-        assert!(!should_retry(reqwest::StatusCode::BAD_REQUEST));
-        assert!(!should_retry(reqwest::StatusCode::UNAUTHORIZED));
-        assert!(!should_retry(reqwest::StatusCode::NOT_FOUND));
-        assert!(!should_retry(reqwest::StatusCode::GONE));
-    }
 
     #[test]
     fn signature_round_trip() {
@@ -473,10 +579,8 @@ mod tests {
         assert_eq!(d.available_permits(), MAX_IN_FLIGHT_DELIVERIES);
     }
 
-    /// Opt-in `WebhookOverflow::Block` must NOT drop events — they wait
-    /// for the consumer to catch up. Proven by pointing at a no-target
-    /// lookup (so the drain never consumes), pushing > capacity events,
-    /// and asserting drops_total stays 0.
+    /// Opt-in `WebhookOverflow::Block` must not drop events that fit its
+    /// staging budget, even past the bounded queue's capacity.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn block_mode_never_drops() {
         let d = WebhookDispatcher::spawn_with_overflow(|_| Vec::new(), WebhookOverflow::Block);
@@ -494,9 +598,87 @@ mod tests {
         assert_eq!(
             d.drops_total(),
             0,
-            "block mode must never drop; got {} drops",
+            "block mode must not drop within its staging budget; got {} drops",
             d.drops_total()
         );
+    }
+
+    /// Pusher retries any non-2xx (not only 5xx/408/429) with backoff. A
+    /// receiver answering 404 then 200 must see exactly two requests.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn non_2xx_is_retried_until_success() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let server_hits = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let n = server_hits.fetch_add(1, Ordering::SeqCst);
+                let mut buf = vec![0u8; 8192];
+                let _ = sock.read(&mut buf).await;
+                let status = if n == 0 { "404 Not Found" } else { "200 OK" };
+                let _ = sock
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            }
+        });
+        let url = format!("http://{addr}/hook");
+        let d = WebhookDispatcher::spawn(move |_| {
+            vec![CompiledTarget {
+                app_id: "app-1".into(),
+                app_key: "key".into(),
+                app_secret: "secret".into(),
+                url: url.clone(),
+                event_filter: Vec::new(),
+                channel_prefix: None,
+            }]
+        });
+        d.enqueue(
+            "app-1",
+            WebhookEvent::ChannelOccupied {
+                channel: "ch".into(),
+            },
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while d.in_flight() == 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        while d.in_flight() > 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "one 404, then one retry");
+        assert_eq!(d.in_flight(), 0, "delivery finished after the 200");
+        assert_eq!(d.available_permits(), MAX_IN_FLIGHT_DELIVERIES);
+    }
+
+    /// Block mode's staging buffer is byte-bounded; past the budget events
+    /// are dropped and counted rather than growing memory without limit.
+    #[tokio::test(flavor = "current_thread")]
+    async fn block_mode_staging_is_byte_bounded() {
+        let mut d = WebhookDispatcher::spawn_with_overflow(|_| Vec::new(), WebhookOverflow::Block);
+        d.block_tx.as_mut().unwrap().limit = 4096;
+        // current_thread: the forwarder cannot run until we yield, so every
+        // event below stays staged.
+        for i in 0..1000 {
+            d.enqueue(
+                "app-1",
+                WebhookEvent::ChannelOccupied {
+                    channel: format!("ch-{i}"),
+                },
+            );
+        }
+        let staged = d.block_tx.as_ref().unwrap().bytes.load(Ordering::Relaxed);
+        assert!(staged <= 4096, "staged {staged} bytes past the budget");
+        assert!(d.drops_total() > 0);
     }
 
     /// Regression: before the fix, an overflowing queue silently discarded

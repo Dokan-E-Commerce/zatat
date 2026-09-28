@@ -53,6 +53,9 @@ pub struct Application {
     pub cache_ttl_seconds: Option<u64>,
     pub max_presence_members_per_channel: u32,
     pub max_presence_member_size_bytes: u32,
+    /// Channels one connection may be subscribed to at once. Bounds the
+    /// memory a single public-key client can pin.
+    pub max_channels_per_connection: u32,
 }
 
 impl std::fmt::Debug for Application {
@@ -103,6 +106,7 @@ impl Application {
             cache_ttl_seconds: None,
             max_presence_members_per_channel: default_max_presence_members(),
             max_presence_member_size_bytes: default_max_presence_member_size_bytes(),
+            max_channels_per_connection: default_max_channels_per_connection(),
         })
     }
 
@@ -114,6 +118,11 @@ impl Application {
     pub fn with_presence_limits(mut self, max_members: u32, max_member_size_bytes: u32) -> Self {
         self.max_presence_members_per_channel = max_members;
         self.max_presence_member_size_bytes = max_member_size_bytes;
+        self
+    }
+
+    pub fn with_max_channels_per_connection(mut self, max: u32) -> Self {
+        self.max_channels_per_connection = max;
         self
     }
 
@@ -146,6 +155,10 @@ fn default_max_presence_members() -> u32 {
 
 fn default_max_presence_member_size_bytes() -> u32 {
     2048
+}
+
+pub fn default_max_channels_per_connection() -> u32 {
+    100
 }
 
 fn build_origin_globset(patterns: &[String]) -> Result<GlobSet, ApplicationError> {

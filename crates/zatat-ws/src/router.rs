@@ -2,8 +2,8 @@ use std::net::SocketAddr;
 
 use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{ConnectInfo, Path, Query, State};
-use axum::http::HeaderMap;
-use axum::response::IntoResponse;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use serde::Deserialize;
@@ -27,12 +27,29 @@ pub struct UpgradeQuery {
 pub fn build_router(state: ServerState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/up", get(health))
         .route("/app/:app_key", get(ws_upgrade))
         .with_state(state)
 }
 
-async fn health() -> &'static str {
-    "ok"
+/// Liveness *and* readiness: 503 once the node is draining, so load
+/// balancers stop sending new connections before the listener closes.
+pub async fn health(State(state): State<ServerState>) -> Response {
+    if state.is_draining() {
+        (StatusCode::SERVICE_UNAVAILABLE, "draining").into_response()
+    } else {
+        "ok".into_response()
+    }
+}
+
+/// Transport-level cap on one inbound WebSocket message (and frame). The
+/// app's `max_message_size` is enforced after parsing with a Pusher error
+/// reply; this bound stops a client from making the server buffer the
+/// transport default of 64 MiB before that check runs.
+fn transport_message_limit(app_max_message_size: u32) -> usize {
+    (app_max_message_size as usize)
+        .saturating_mul(4)
+        .max(64 * 1024)
 }
 
 async fn ws_upgrade(
@@ -42,7 +59,11 @@ async fn ws_upgrade(
     State(state): State<ServerState>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
-) -> impl IntoResponse {
+) -> Response {
+    if state.is_draining() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "server is shutting down").into_response();
+    }
+
     // Pusher protocol contract: surface rejections as WS close codes, not
     // pre-upgrade HTTP. Browsers see HTTP 401/400 pre-upgrade as a generic
     // "connection failed"; they only surface the Pusher error code when the
@@ -55,16 +76,22 @@ async fn ws_upgrade(
         None => {
             warn!(app_key = %app_key, "rejected connection: unknown app_key (sending 4001)");
             let app_key_owned = app_key.clone();
-            return ws.on_upgrade(move |socket| async move {
-                crate::handler::run_rejected_connection(
-                    socket,
-                    4001,
-                    format!("Application does not exist for key '{app_key_owned}'"),
-                )
-                .await;
-            });
+            return ws
+                .max_message_size(64 * 1024)
+                .max_frame_size(64 * 1024)
+                .on_upgrade(move |socket| async move {
+                    crate::handler::run_rejected_connection(
+                        socket,
+                        4001,
+                        format!("Application does not exist for key '{app_key_owned}'"),
+                    )
+                    .await;
+                })
+                .into_response();
         }
     };
+    let limit = transport_message_limit(app.max_message_size);
+    let ws = ws.max_message_size(limit).max_frame_size(limit);
 
     // 4007: unsupported Pusher protocol version.
     if let Some(protocol) = q.protocol.as_deref() {
@@ -82,7 +109,7 @@ async fn ws_upgrade(
                         ),
                     )
                     .await;
-                });
+                }).into_response();
             }
         }
     }
@@ -128,9 +155,10 @@ async fn ws_upgrade(
             run_connection(state, app, socket, origin).await;
         }
     })
+    .into_response()
 }
 
-fn url_host_or_self(raw: &str) -> &str {
+pub(crate) fn url_host_or_self(raw: &str) -> &str {
     if let Some(rest) = raw.split_once("://").map(|(_, r)| r) {
         let authority = rest.split('/').next().unwrap_or("");
         if let Some(rest) = authority.strip_prefix('[') {
@@ -146,6 +174,13 @@ fn url_host_or_self(raw: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_limit_covers_app_limit_with_a_floor() {
+        assert_eq!(transport_message_limit(10_000), 64 * 1024);
+        assert_eq!(transport_message_limit(100_000), 400_000);
+        assert_eq!(transport_message_limit(u32::MAX), u32::MAX as usize * 4);
+    }
 
     #[test]
     fn origin_parser_strips_scheme_and_port() {
